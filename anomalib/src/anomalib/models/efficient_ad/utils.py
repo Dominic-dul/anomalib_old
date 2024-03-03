@@ -10,7 +10,7 @@ from torch.utils.data import Dataset
 from torchvision import datasets, transforms
 from torchvision.datasets import ImageFolder
 
-import config as c
+import anomalib.models.efficient_ad.config as c
 
 
 def train_dataset(train_function, get_mask=False):
