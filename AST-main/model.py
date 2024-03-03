@@ -145,22 +145,30 @@ class Model(nn.Module):
 class res_block(nn.Module):
     def __init__(self, channels):
         super(res_block, self).__init__()
+        # First convolution layer to process the input tensor
         self.l1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        # Second convolution layer for further processing
         self.l2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        # Activation function to introduce non-linearity
         self.act = nn.LeakyReLU()
+        # Batch normalization to stabilize and speed up training
         self.bn1 = nn.BatchNorm2d(channels)
+        # Second batch normalization for the second convolution layer
         self.bn2 = nn.BatchNorm2d(channels)
 
     def forward(self, x):
+        # Store the original input for the residual connection
         inp = x
+        # First layer processing
         x = self.l1(x)
         x = self.bn1(x)
         x = self.act(x)
 
+        # Second layer processing
         x = self.l2(x)
         x = self.bn2(x)
         x = self.act(x)
-        # Applying residual connection.
+        # Adding the input back to the output (residual connection)
         x = x + inp
         return x
 
@@ -168,28 +176,35 @@ class res_block(nn.Module):
 class Student(nn.Module):
     def __init__(self, channels_hidden=c.channels_hidden_student, n_blocks=c.n_st_blocks):
         super(Student, self).__init__()
+        # Calculate input features, adjust for positional encoding if used
         inp_feat = c.n_feat if not c.pos_enc else c.n_feat + c.pos_enc_dim
+        # Initial convolution layer to adapt the input feature size
         self.conv1 = nn.Conv2d(inp_feat, channels_hidden, kernel_size=3, padding=1)
+        # Final convolution layer to produce the output feature map
         self.conv2 = nn.Conv2d(channels_hidden, c.n_feat, kernel_size=3, padding=1)
+        # Initialize the residual blocks
         self.res = list()
         # Initializing residual blocks.
         for _ in range(n_blocks):
             self.res.append(res_block(channels_hidden))
         self.res = nn.ModuleList(self.res)
-        # Learnable parameter for scaling.
+        # Learnable scaling parameter for the output
         self.gamma = nn.Parameter(torch.zeros(1))
+        # Activation function for non-linearity
         self.act = nn.LeakyReLU()
 
     def forward(self, x):
-        # Concatenating positional encoding if enabled.
+        # Concatenate positional encoding to the input if enabled
         if c.pos_enc:
             x = torch.cat(x, dim=1)
 
+        # Process input through the initial convolution layer
         x = self.act(self.conv1(x))
-        # Passing through residual blocks.
+        # Pass the output through each residual block
         for i in range(len(self.res)):
             x = self.res[i](x)
 
+        # Final convolution to produce the output feature map
         x = self.conv2(x)
         return x
 
