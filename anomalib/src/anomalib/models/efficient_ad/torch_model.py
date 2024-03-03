@@ -55,6 +55,37 @@ class EfficientAdModelSize(str, Enum):
     M = "medium"
     S = "small"
 
+# A residual block used in the student model for processing features.
+class res_block(nn.Module):
+    def __init__(self, channels):
+        super(res_block, self).__init__()
+        # First convolution layer to process the input tensor
+        self.l1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        # Second convolution layer for further processing
+        self.l2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        # Activation function to introduce non-linearity
+        self.act = nn.LeakyReLU()
+        # Batch normalization to stabilize and speed up training
+        self.bn1 = nn.BatchNorm2d(channels)
+        # Second batch normalization for the second convolution layer
+        self.bn2 = nn.BatchNorm2d(channels)
+
+    def forward(self, x):
+        # Store the original input for the residual connection
+        inp = x
+        # First layer processing
+        x = self.l1(x)
+        x = self.bn1(x)
+        x = self.act(x)
+
+        # Second layer processing
+        x = self.l2(x)
+        x = self.bn2(x)
+        x = self.act(x)
+        # Adding the input back to the output (residual connection)
+        x = x + inp
+        return x
+
 # Small Patch Description Network (PDN)
 class PDN_S(nn.Module):
     """Patch Description Network small
@@ -67,23 +98,18 @@ class PDN_S(nn.Module):
         super().__init__()
         # Define convolutional layers with optional padding
         pad_mult = 1 if padding else 0
-        self.conv1 = nn.Conv2d(3, 128, kernel_size=4, stride=1, padding=3 * pad_mult)
-        self.conv2 = nn.Conv2d(128, 256, kernel_size=4, stride=1, padding=3 * pad_mult)
-        self.conv3 = nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1 * pad_mult)
-        self.conv4 = nn.Conv2d(256, out_channels, kernel_size=4, stride=1, padding=0 * pad_mult)
-        # Define average pooling layers with optional padding
-        self.avgpool1 = nn.AvgPool2d(kernel_size=2, stride=2, padding=1 * pad_mult)
-        self.avgpool2 = nn.AvgPool2d(kernel_size=2, stride=2, padding=1 * pad_mult)
+        self.initial_conv = nn.Conv2d(3, out_channels // 2, kernel_size=3, stride=1, padding=pad_mult)
+        self.res_blocks = nn.Sequential(*[res_block(out_channels // 2) for _ in range(n_blocks)])
+        self.final_conv = nn.Conv2d(out_channels // 2, out_channels, kernel_size=3, stride=1, padding=pad_mult)
+        self.act = nn.LeakyReLU()
 
-    # Process input through layers and apply activations
     def forward(self, x):
+        # Normalize the input batch using ImageNet standards
         x = imagenet_norm_batch(x)
-        x = F.relu(self.conv1(x))
-        x = self.avgpool1(x)
-        x = F.relu(self.conv2(x))
-        x = self.avgpool2(x)
-        x = F.relu(self.conv3(x))
-        x = self.conv4(x)
+        x = self.initial_conv(x)
+        x = self.act(x)
+        x = self.res_blocks(x)
+        x = self.final_conv(x)
         return x
 
 # Medium Patch Description Network (PDN)
