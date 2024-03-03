@@ -28,6 +28,7 @@ from .torch_model import EfficientAdModel, EfficientAdModelSize, reduce_tensor_e
 
 logger = logging.getLogger(__name__)
 
+# Information for downloading the Imagenette dataset and pretrained weights
 IMAGENETTE_DOWNLOAD_INFO = DownloadInfo(
     name="imagenette2.tgz",
     url="https://s3.amazonaws.com/fast-ai-imageclas/imagenette2.tgz",
@@ -40,15 +41,17 @@ WEIGHTS_DOWNLOAD_INFO = DownloadInfo(
     hash="ec6113d728969cd233271eeed7d692f2",
 )
 
-
+# Wrapper for transforms to make them compatible with PyTorch
 class TransformsWrapper:
+    # Store the composition of transforms
     def __init__(self, t: A.Compose):
         self.transforms = t
 
+    # Apply the transforms to the image and return it
     def __call__(self, img, *args, **kwargs):
         return self.transforms(image=np.array(img))
 
-
+# Main class for the EfficientAd anomaly detection model
 class EfficientAd(AnomalyModule):
     """PL Lightning Module for the EfficientAd algorithm.
 
@@ -65,6 +68,7 @@ class EfficientAd(AnomalyModule):
         batch_size (int): batch size for imagenet dataloader
     """
 
+    # Model setup, including loading pretrained weights and preparing data
     def __init__(
         self,
         teacher_out_channels: int,
@@ -94,6 +98,7 @@ class EfficientAd(AnomalyModule):
         self.prepare_pretrained_model()
         self.prepare_imagenette_data()
 
+    # Method to prepare and load pretrained model weights
     def prepare_pretrained_model(self) -> None:
         pretrained_models_dir = Path("./pre_trained/")
         if not (pretrained_models_dir / "efficientad_pretrained_weights").is_dir():
@@ -104,6 +109,7 @@ class EfficientAd(AnomalyModule):
         logger.info(f"Load pretrained teacher model from {teacher_path}")
         self.model.teacher.load_state_dict(torch.load(teacher_path, map_location=torch.device(self.device)))
 
+    # Method to download and prepare the Imagenette dataset
     def prepare_imagenette_data(self) -> None:
         self.data_transforms_imagenet = A.Compose(
             [  # We obtain an image P ∈ R 3×256×256 from ImageNet by choosing a random image,
@@ -122,6 +128,7 @@ class EfficientAd(AnomalyModule):
         self.imagenet_loader = DataLoader(imagenet_dataset, batch_size=self.batch_size, shuffle=True, pin_memory=True)
         self.imagenet_iterator = iter(self.imagenet_loader)
 
+    # Method to calculate mean and std of teacher model outputs for normalization
     @torch.no_grad()
     def teacher_channel_mean_std(self, dataloader: DataLoader) -> dict[str, Tensor]:
         """Calculate the mean and std of the teacher models activations.
@@ -161,6 +168,7 @@ class EfficientAd(AnomalyModule):
 
         return {"mean": channel_mean, "std": channel_std}
 
+    # Method to calculate normalization quantiles for anomaly maps
     @torch.no_grad()
     def map_norm_quantiles(self, dataloader: DataLoader) -> dict[str, Tensor]:
         """Calculate 90% and 99.5% quantiles of the student(st) and autoencoder(ae).
@@ -207,6 +215,7 @@ class EfficientAd(AnomalyModule):
         qb = torch.quantile(maps_flat, q=0.995).to(self.device)
         return qa, qb
 
+    # Configure optimizers and learning rate schedulers
     def configure_optimizers(self) -> optim.Optimizer:
         optimizer = optim.Adam(
             list(self.model.student.parameters()) + list(self.model.ae.parameters()),
@@ -219,12 +228,14 @@ class EfficientAd(AnomalyModule):
         scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=int(0.95 * num_steps), gamma=0.1)
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
+    # Actions to perform at the start of training
     def on_train_start(self) -> None:
         """Calculate or load the channel-wise mean and std of the training dataset and push to the model."""
         if not self.model.is_set(self.model.mean_std):
             channel_mean_std = self.teacher_channel_mean_std(self.trainer.datamodule.train_dataloader())
             self.model.mean_std.update(channel_mean_std)
 
+    # Define the training logic, including loss calculation
     def training_step(self, batch: dict[str, str | Tensor], *args, **kwargs) -> dict[str, Tensor]:
         """Training step for EfficientAd returns the student, autoencoder and combined loss.
 
@@ -252,6 +263,7 @@ class EfficientAd(AnomalyModule):
         self.log("train_loss", loss.item(), on_epoch=True, prog_bar=True, logger=True)
         return {"loss": loss}
 
+    # Prepare for validation by calculating normalization quantiles
     def on_validation_start(self) -> None:
         """
         Calculate the feature map quantiles of the validation dataset and push to the model.
@@ -259,6 +271,7 @@ class EfficientAd(AnomalyModule):
         map_norm_quantiles = self.map_norm_quantiles(self.trainer.datamodule.val_dataloader())
         self.model.quantiles.update(map_norm_quantiles)
 
+    # Define the validation logic, including generating anomaly maps
     def validation_step(self, batch: dict[str, str | Tensor], *args, **kwargs) -> STEP_OUTPUT:
         """Validation Step of EfficientAd returns anomaly maps for the input image batch
 
@@ -274,7 +287,7 @@ class EfficientAd(AnomalyModule):
 
         return batch
 
-
+# A subclass for integrating EfficientAd into PyTorch Lightning with additional configurations
 class EfficientAdLightning(EfficientAd):
     """PL Lightning Module for the EfficientAd Algorithm.
 
