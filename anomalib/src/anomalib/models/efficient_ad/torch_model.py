@@ -16,14 +16,15 @@ from torchvision import transforms
 
 logger = logging.getLogger(__name__)
 
-
+# Normalize images according to ImageNet standards
 def imagenet_norm_batch(x):
+    # Predefined mean and std for normalization
     mean = torch.tensor([0.485, 0.456, 0.406])[None, :, None, None].to(x.device)
     std = torch.tensor([0.229, 0.224, 0.225])[None, :, None, None].to(x.device)
-    x_norm = (x - mean) / std
+    x_norm = (x - mean) / std # Normalize
     return x_norm
 
-
+# Reduce the number of elements in a tensor for efficient processing
 def reduce_tensor_elems(tensor: torch.Tensor, m=2**24) -> torch.Tensor:
     """Flattens n-dimensional tensors,  selects m elements from it
     and returns the selected elements as tensor. It is used to select
@@ -39,6 +40,7 @@ def reduce_tensor_elems(tensor: torch.Tensor, m=2**24) -> torch.Tensor:
             Tensor: reduced tensor
     """
     tensor = torch.flatten(tensor)
+    # If tensor is too big, sample a subset
     if len(tensor) > m:
         # select a random subset with m elements.
         perm = torch.randperm(len(tensor), device=tensor.device)
@@ -46,14 +48,14 @@ def reduce_tensor_elems(tensor: torch.Tensor, m=2**24) -> torch.Tensor:
         tensor = tensor[idx]
     return tensor
 
-
+# Enum for model sizes (small, medium)
 class EfficientAdModelSize(str, Enum):
     """Supported EfficientAd model sizes"""
 
     M = "medium"
     S = "small"
 
-
+# Small Patch Description Network (PDN)
 class PDN_S(nn.Module):
     """Patch Description Network small
 
@@ -63,14 +65,17 @@ class PDN_S(nn.Module):
 
     def __init__(self, out_channels: int, padding: bool = False) -> None:
         super().__init__()
+        # Define convolutional layers with optional padding
         pad_mult = 1 if padding else 0
         self.conv1 = nn.Conv2d(3, 128, kernel_size=4, stride=1, padding=3 * pad_mult)
         self.conv2 = nn.Conv2d(128, 256, kernel_size=4, stride=1, padding=3 * pad_mult)
         self.conv3 = nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1 * pad_mult)
         self.conv4 = nn.Conv2d(256, out_channels, kernel_size=4, stride=1, padding=0 * pad_mult)
+        # Define average pooling layers with optional padding
         self.avgpool1 = nn.AvgPool2d(kernel_size=2, stride=2, padding=1 * pad_mult)
         self.avgpool2 = nn.AvgPool2d(kernel_size=2, stride=2, padding=1 * pad_mult)
 
+    # Process input through layers and apply activations
     def forward(self, x):
         x = imagenet_norm_batch(x)
         x = F.relu(self.conv1(x))
@@ -81,7 +86,7 @@ class PDN_S(nn.Module):
         x = self.conv4(x)
         return x
 
-
+# Medium Patch Description Network (PDN)
 class PDN_M(nn.Module):
     """Patch Description Network medium
 
@@ -113,12 +118,13 @@ class PDN_M(nn.Module):
         x = self.conv6(x)
         return x
 
-
+# Encoder part of the Autoencoder
 class Encoder(nn.Module):
     """Autoencoder Encoder model."""
 
     def __init__(self) -> None:
         super().__init__()
+        # Define encoding layers to compress input images
         self.enconv1 = nn.Conv2d(3, 32, kernel_size=4, stride=2, padding=1)
         self.enconv2 = nn.Conv2d(32, 32, kernel_size=4, stride=2, padding=1)
         self.enconv3 = nn.Conv2d(32, 64, kernel_size=4, stride=2, padding=1)
@@ -127,6 +133,7 @@ class Encoder(nn.Module):
         self.enconv6 = nn.Conv2d(64, 64, kernel_size=8, stride=1, padding=0)
 
     def forward(self, x):
+        # Encode input image to a smaller representation
         x = F.relu(self.enconv1(x))
         x = F.relu(self.enconv2(x))
         x = F.relu(self.enconv3(x))
@@ -135,7 +142,7 @@ class Encoder(nn.Module):
         x = self.enconv6(x)
         return x
 
-
+# Decoder part of the Autoencoder
 class Decoder(nn.Module):
     """Autoencoder Decoder model.
 
@@ -151,6 +158,7 @@ class Decoder(nn.Module):
             int(img_size[0] / 4) if padding else int(img_size[0] / 4) - 8,
             int(img_size[1] / 4) if padding else int(img_size[1] / 4) - 8,
         )
+         # Define decoding layers to expand input images
         self.deconv1 = nn.Conv2d(64, 64, kernel_size=4, stride=1, padding=2)
         self.deconv2 = nn.Conv2d(64, 64, kernel_size=4, stride=1, padding=2)
         self.deconv3 = nn.Conv2d(64, 64, kernel_size=4, stride=1, padding=2)
@@ -167,6 +175,7 @@ class Decoder(nn.Module):
         self.dropout6 = nn.Dropout(p=0.2)
 
     def forward(self, x):
+        # Decode input image to a normal size representation
         x = F.interpolate(x, size=(int(self.img_size[0] / 64) - 1, int(self.img_size[1] / 64) - 1), mode="bilinear")
         x = F.relu(self.deconv1(x))
         x = self.dropout1(x)
@@ -190,7 +199,7 @@ class Decoder(nn.Module):
         x = self.deconv8(x)
         return x
 
-
+# AutoEncoder combining Encoder and Decoder
 class AutoEncoder(nn.Module):
     """EfficientAd Autoencoder.
 
@@ -205,6 +214,7 @@ class AutoEncoder(nn.Module):
         self.decoder = Decoder(out_channels, padding, img_size)
 
     def forward(self, x):
+        # Encode then decode the input
         x = imagenet_norm_batch(x)
         x = self.encoder(x)
         x = self.decoder(x)
@@ -224,7 +234,7 @@ class EfficientAdModel(nn.Module):
             output anomaly maps so that their size matches the size in the padding = True case.
         device (str): which device the model should be loaded on
     """
-
+    # Initialize EfficientAd model with configurations for teacher and student networks, and autoencoder
     def __init__(
         self,
         teacher_out_channels: int,
@@ -250,10 +260,19 @@ class EfficientAdModel(nn.Module):
         else:
             raise ValueError(f"Unknown model size {model_size}")
 
+        # Initialize the autoencoder with the specified configuration.
         self.ae: AutoEncoder = AutoEncoder(out_channels=teacher_out_channels, padding=padding, img_size=input_size)
+        # Store the number of output channels for the teacher model. This information
+        # is essential for setting up the model architecture and for comparison between
+        # the teacher and student model outputs.
         self.teacher_out_channels: int = teacher_out_channels
+        # Record the expected input image size. This ensures that the model processes
+        # inputs correctly and is configured properly for handling images of this size.
         self.input_size: tuple[int, int] = input_size
 
+        # Initialize parameters for normalizing the outputs of the teacher model.
+        # The mean and standard deviation are initially set to zeros and will be updated
+        # during model training. This normalization helps in stabilizing the model's learning.
         self.mean_std: nn.ParameterDict = nn.ParameterDict(
             {
                 "mean": torch.zeros((1, self.teacher_out_channels, 1, 1)),
@@ -261,6 +280,9 @@ class EfficientAdModel(nn.Module):
             }
         )
 
+        # Initialize parameters for quantiles used in normalizing anomaly scores.
+        # These values are crucial for scaling anomaly maps to a consistent range,
+        # making the model's outputs more interpretable and comparable.
         self.quantiles: nn.ParameterDict = nn.ParameterDict(
             {
                 "qa_st": torch.tensor(0.0),
@@ -270,12 +292,14 @@ class EfficientAdModel(nn.Module):
             }
         )
 
+    # Check if mean and standard deviation parameters are set for normalization
     def is_set(self, p_dic: nn.ParameterDict) -> bool:
         for _, value in p_dic.items():
             if value.sum() != 0:
                 return True
         return False
 
+    # Randomly apply image transformations to augment data for robust learning
     def choose_random_aug_image(self, image: Tensor) -> Tensor:
         transform_functions = [
             transforms.functional.adjust_brightness,
@@ -300,58 +324,82 @@ class EfficientAdModel(nn.Module):
         with torch.no_grad():
             teacher_output = self.teacher(batch)
             if self.is_set(self.mean_std):
+                # Normalize the teacher's output using pre-set mean and std
                 teacher_output = (teacher_output - self.mean_std["mean"]) / self.mean_std["std"]
-
+                
+        # Generate the student's output from the same input batch for anomaly comparison
         student_output = self.student(batch)
+        # Calculate squared difference between teacher and student outputs
         distance_st = torch.pow(teacher_output - student_output[:, : self.teacher_out_channels, :, :], 2)
 
         if self.training:
-            # Student loss
+            # Calculate the student loss
+            # Reduce the dimensionality of the distance tensor to simplify loss calculation
             distance_st = reduce_tensor_elems(distance_st)
+            # Find the hardest examples to focus on during training
             d_hard = torch.quantile(distance_st, 0.999)
+            # Calculate the loss for these hard examples
             loss_hard = torch.mean(distance_st[distance_st >= d_hard])
+            # Calculate penalty for the student's output using augmented ImageNet images
             student_output_penalty = self.student(batch_imagenet)[:, : self.teacher_out_channels, :, :]
             loss_penalty = torch.mean(student_output_penalty**2)
+            # Combine the hard loss and penalty for the total student loss
             loss_st = loss_hard + loss_penalty
 
-            # Autoencoder and Student AE Loss
+            # Calculate the autoencoder and combined student-autoencoder loss
+            # Augment the input batch for robustness
             aug_img = self.choose_random_aug_image(batch)
+             # Get the autoencoder's output for the augmented image
             ae_output_aug = self.ae(aug_img)
 
+            # Normalize teacher's output for augmented image if mean and std are set
             with torch.no_grad():
                 teacher_output_aug = self.teacher(aug_img)
                 if self.is_set(self.mean_std):
                     teacher_output_aug = (teacher_output_aug - self.mean_std["mean"]) / self.mean_std["std"]
-
+                    
+            # Calculate the student's output for the augmented image
             student_output_ae_aug = self.student(aug_img)[:, self.teacher_out_channels :, :, :]
 
+            # Calculate distances for loss between teacher's output and autoencoder, and autoencoder and student
             distance_ae = torch.pow(teacher_output_aug - ae_output_aug, 2)
             distance_stae = torch.pow(ae_output_aug - student_output_ae_aug, 2)
 
+            # Calculate losses for autoencoder and the combination of student and autoencoder
             loss_ae = torch.mean(distance_ae)
             loss_stae = torch.mean(distance_stae)
+            # Return the combined losses
             return (loss_st, loss_ae, loss_stae)
 
         else:
+            # In evaluation mode, calculate anomaly maps instead of losses
             with torch.no_grad():
+                 # Get the autoencoder output for the original batch
                 ae_output = self.ae(batch)
 
+            # Calculate mean squared distance between teacher and student outputs
             map_st = torch.mean(distance_st, dim=1, keepdim=True)
+            # Calculate mean squared distance for autoencoder and student outputs
             map_stae = torch.mean(
                 (ae_output - student_output[:, self.teacher_out_channels :]) ** 2, dim=1, keepdim=True
             )
 
+            # Optionally pad the anomaly maps to match input size
             if self.pad_maps:
                 map_st = F.pad(map_st, (4, 4, 4, 4))
                 map_stae = F.pad(map_stae, (4, 4, 4, 4))
+            # Resize anomaly maps to original input size
             map_st = F.interpolate(map_st, size=(self.input_size[0], self.input_size[1]), mode="bilinear")
             map_stae = F.interpolate(map_stae, size=(self.input_size[0], self.input_size[1]), mode="bilinear")
 
+            # Normalize anomaly maps if quantiles are set
             if self.is_set(self.quantiles) and normalize:
                 map_st = 0.1 * (map_st - self.quantiles["qa_st"]) / (self.quantiles["qb_st"] - self.quantiles["qa_st"])
                 map_stae = (
                     0.1 * (map_stae - self.quantiles["qa_ae"]) / (self.quantiles["qb_ae"] - self.quantiles["qa_ae"])
                 )
 
+            # Combine the anomaly maps from student and autoencoder
             map_combined = 0.5 * map_st + 0.5 * map_stae
+            # Return the combined anomaly map
             return {"anomaly_map": map_combined, "map_st": map_st, "map_ae": map_stae}
