@@ -7,8 +7,8 @@ import torch.nn.functional as F
 from math import exp
 from torch.autograd import Variable
 
-import config as c
-from utils import *
+import anomalib.models.efficient_ad.config as c
+from anomalib.models.efficient_ad.utils import *
 
 VERBOSE = False
 

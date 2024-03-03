@@ -15,7 +15,7 @@ from efficientnet_pytorch import EfficientNet
 from enum import Enum
 from torch import Tensor, nn
 from torchvision import transforms
-from freia_funcs import *
+from anomalib.models.efficient_ad.freia_funcs import *
 
 logger = logging.getLogger(__name__)
 
