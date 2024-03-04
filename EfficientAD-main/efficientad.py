@@ -13,6 +13,9 @@ from tqdm import tqdm
 from common import get_autoencoder, get_pdn_small, get_pdn_medium, \
     ImageFolderWithoutTarget, ImageFolderWithPath, InfiniteDataloader
 from sklearn.metrics import roc_auc_score
+from efficientnet_pytorch import EfficientNet
+import torch.nn.functional as F
+from freia_funcs import *
 
 def get_argparse():
     parser = argparse.ArgumentParser()
@@ -59,6 +62,129 @@ transform_ae = transforms.RandomChoice([
 
 def train_transform(image):
     return default_transform(image), default_transform(transform_ae(image))
+
+class FeatureExtractor(nn.Module):
+    def __init__(self, layer_idx=35):
+        super(FeatureExtractor, self).__init__()
+        self.feature_extractor = EfficientNet.from_pretrained('efficientnet-b5')
+        # Index of the layer to extract features from.
+        self.layer_idx = layer_idx
+
+    # Processing through EfficientNet up to specified layer.
+    def forward(self, x):
+        x = self.feature_extractor._swish(self.feature_extractor._bn0(self.feature_extractor._conv_stem(x)))
+        # Blocks
+        for idx, block in enumerate(self.feature_extractor._blocks):
+            drop_connect_rate = self.feature_extractor._global_params.drop_connect_rate
+            if drop_connect_rate:
+                drop_connect_rate *= float(idx) / len(self.feature_extractor._blocks)  # scale drop connect_rate
+            x = block(x, drop_connect_rate=drop_connect_rate)
+            if idx == self.layer_idx:
+                # Returning features from the specified layer.
+                return x
+
+# Function to create a normalizing flow model for the teacher.
+def get_nf(input_dim=368, channels_hidden=64):
+    nodes = list()
+    # If positional encoding is enabled, add an input node for it.
+    nodes.append(InputNode(32, name='input'))
+    # Main input node.
+    nodes.append(InputNode(input_dim, name='input'))
+    # Creating coupling blocks.
+    kernel_sizes = [3, 3, 3, 5]
+    for k in range(4):
+        nodes.append(Node([nodes[-1].out0], permute_layer, {'seed': k}, name=F'permute_{k}'))
+        # Conditional coupling layer if positional encoding is used.
+        nodes.append(Node([nodes[-1].out0, nodes[0].out0], glow_coupling_layer_cond,
+                          {'clamp': 1.9,
+                           'F_class': F_conv,
+                           'cond_dim': 32,
+                           'F_args': {'channels_hidden': channels_hidden,
+                                      'kernel_size': kernel_sizes[k]}},
+                          name=F'conv_{k}'))
+    # Output node.
+    nodes.append(OutputNode([nodes[-1].out0], name='output'))
+    # Creating the reversible graph net.
+    nf = ReversibleGraphNet(nodes, n_jac=1)
+    return nf
+
+def positionalencoding2d(D, H, W):
+    """
+    taken from https://github.com/gudovskiy/cflow-ad
+    :param D: dimension of the model
+    :param H: H of the positions
+    :param W: W of the positions
+    :return: DxHxW position matrix
+    """
+    # Creates a positional encoding matrix.
+    if D % 4 != 0:
+        raise ValueError("Cannot use sin/cos positional encoding with odd dimension (got dim={:d})".format(D))
+    P = torch.zeros(D, H, W)
+    # Each dimension use half of D
+    D = D // 2
+    div_term = torch.exp(torch.arange(0.0, D, 2) * -(np.log(1e4) / D))
+    pos_w = torch.arange(0.0, W).unsqueeze(1)
+    pos_h = torch.arange(0.0, H).unsqueeze(1)
+    P[0:D:2, :, :] = torch.sin(pos_w * div_term).transpose(0, 1).unsqueeze(1).repeat(1, H, 1)
+    P[1:D:2, :, :] = torch.cos(pos_w * div_term).transpose(0, 1).unsqueeze(1).repeat(1, H, 1)
+    P[D::2, :, :] = torch.sin(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, W)
+    P[D + 1::2, :, :] = torch.cos(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, W)
+    # Returns the positional encoding.
+    return P.to('cuda')[None]
+
+class TeacherModel(nn.Module):
+    def __init__(self):
+        super(TeacherModel, self).__init__()
+
+        self.feature_extractor = FeatureExtractor()
+        self.net = get_nf()
+        # Positional encoding initialization if enabled.
+        self.pos_enc = positionalencoding2d(32, 384, 384)
+
+        # Unshuffle operation for processing depth information.
+        self.unshuffle = nn.PixelUnshuffle(8)
+
+    def forward(self, x, depth):
+        # Feature extraction based on the mode and configuration.
+        with torch.no_grad():
+            f = self.feature_extractor(x)
+
+        inp = torch.cat([f, self.unshuffle(depth)], dim=1)
+
+        # Processing through the network with positional encoding.
+        cond = self.pos_enc.tile(inp.shape[0], 1, 1, 1)
+        z = self.net([cond, inp])
+
+        # Calculating the Jacobian for the normalizing flow.
+        jac = self.net.jacobian(run_forward=False)[0]
+        # Returning the transformed input and Jacobian.
+        return z, jac
+
+class Score_Observer:
+    '''Keeps an eye on the current and highest score so far'''
+
+    def __init__(self, name, percentage=True):
+        self.name = name
+        self.max_epoch = 0
+        self.best_score = None
+        self.last_score = None
+        self.percentage = percentage
+
+    def update(self, score, epoch, print_score=False):
+        if self.percentage:
+            score = score * 100
+        self.last_score = score
+        improved = False
+        if epoch == 0 or score > self.best_score:
+            self.best_score = score
+            improved = True
+        if print_score:
+            self.print_score()
+        return improved
+
+    def print_score(self):
+        print('{:s}: \t last: {:.2f} \t best: {:.2f}'.format(self.name, self.last_score, self.best_score))
+
 
 def main():
     torch.manual_seed(seed)
@@ -150,6 +276,17 @@ def main():
     teacher.eval()
     student.train()
     autoencoder.train()
+
+    # ast teacher model ---------------------------
+    teacherv2 = TeacherModel()
+    teacherv2.to('cuda')
+    optimizerv2 = torch.optim.Adam(teacherv2.net.parameters(), lr=2e-4, eps=1e-08, weight_decay=1e-5)
+    # Observers to track AUROC scores during training.
+    mean_nll_obs = Score_Observer('AUROC mean over maps')
+    max_nll_obs = Score_Observer('AUROC  max over maps')
+    teacherv2.train()
+    train_loss = list()
+    # -----------------------------
 
     if on_gpu:
         teacher.cuda()
