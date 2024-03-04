@@ -287,6 +287,28 @@ class Score_Observer:
     def print_score(self):
         print('{:s}: \t last: {:.2f} \t best: {:.2f}'.format(self.name, self.last_score, self.best_score))
 
+def downsampling(x, size, to_tensor=False, bin=True):
+    if to_tensor:
+        x = torch.FloatTensor(x).to(c.device)
+    down = F.interpolate(x, size=size, mode='bilinear', align_corners=False)
+    if bin:
+        down[down > 0] = 1
+    return down
+
+def t2np(tensor):
+    '''pytorch tensor -> numpy array'''
+    return tensor.cpu().data.numpy() if tensor is not None else None
+
+def get_nf_loss(z, jac, mask=None, per_sample=False, per_pixel=False):
+    if not False:
+        mask = 0 * mask + 1
+    loss_per_pixel = (0.5 * torch.sum(mask * z ** 2, dim=1) - jac * mask[:, 0])
+    if per_pixel:
+        return loss_per_pixel
+    loss_per_sample = torch.mean(loss_per_pixel, dim=(-1, -2))
+    if per_sample:
+        return loss_per_sample
+    return loss_per_sample.mean()
 
 def main():
     torch.manual_seed(seed)
@@ -388,7 +410,34 @@ def main():
     max_nll_obs = Score_Observer('AUROC  max over maps')
     teacherv2.train()
     train_loss = list()
-    trail_loader_v2 = DataLoader(DefectDataset(set='train', get_mask=False, get_features=False), pin_memory=True, batch_size=8, shuffle=True, drop_last=True)
+    train_loader_v2 = DataLoader(DefectDataset(set='train', get_mask=False, get_features=False), pin_memory=True, batch_size=8, shuffle=True, drop_last=True)
+
+    for i, data in enumerate(tqdm(train_loader_v2, disable=False)):
+        # Clear gradients.
+        optimizerv2.zero_grad()
+
+        # Unpack data and move to device.
+        depth, fg, labels, image, features = data
+        depth, fg, labels, image, features = [t.to('cuda') for t in [depth, fg, labels, image, features]]
+
+        # Downsample foreground mask to match the model output size.
+        fg_down = downsampling(fg, (24, 24), bin=False)
+        # Forward pass through the model.
+        z, jac = teacherv2(image, depth)
+
+        # Calculate loss and backpropagate.
+        loss = get_nf_loss(z, jac, fg_down)
+        # Convert tensor loss to numpy and store.
+        train_loss.append(t2np(loss))
+
+        # Compute gradients.
+        loss.backward()
+        # Update model parameters.
+        optimizerv2.step()
+
+    # Calculate mean training loss for the epoch.
+    mean_train_loss = np.mean(train_loss)
+    print('Epoch: {:d}.{:d} \t train loss: {:.4f}'.format(1, 1, mean_train_loss))
     # -----------------------------
 
     if on_gpu:
