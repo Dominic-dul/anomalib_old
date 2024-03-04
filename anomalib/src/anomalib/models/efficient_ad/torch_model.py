@@ -320,6 +320,31 @@ class TeacherModel(nn.Module):
         # Returning the transformed input and Jacobian.
         return z, jac
 
+class Score_Observer:
+    '''Keeps an eye on the current and highest score so far'''
+
+    def __init__(self, name, percentage=True):
+        self.name = name
+        self.max_epoch = 0
+        self.best_score = None
+        self.last_score = None
+        self.percentage = percentage
+
+    def update(self, score, epoch, print_score=False):
+        if self.percentage:
+            score = score * 100
+        self.last_score = score
+        improved = False
+        if epoch == 0 or score > self.best_score:
+            self.best_score = score
+            improved = True
+        if print_score:
+            self.print_score()
+        return improved
+
+    def print_score(self):
+        print('{:s}: \t last: {:.2f} \t best: {:.2f}'.format(self.name, self.last_score, self.best_score))
+
 class EfficientAdModel(nn.Module):
     """EfficientAd model.
 

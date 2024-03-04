@@ -10,7 +10,7 @@ modelname = "my_experiment" # export evaluations/logs with this name
 print(modelname)
 
 # inputs
-img_len = 768 # width/height of input image
+img_len = 768 # width/height of input imagef
 img_size = (img_len, img_len) 
 img_dims = [3] + list(img_size)
 depth_len = img_len // 4 # width/height of depth maps
