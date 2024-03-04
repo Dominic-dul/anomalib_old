@@ -3,8 +3,8 @@
 import numpy as np
 import tifffile
 import torch
-from torch.utils.data import DataLoader
-from torchvision import transforms
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms, datasets
 import argparse
 import itertools
 import os
@@ -16,6 +16,11 @@ from sklearn.metrics import roc_auc_score
 from efficientnet_pytorch import EfficientNet
 import torch.nn.functional as F
 from freia_funcs import *
+import torch.nn as nn
+from PIL import Image
+from os.path import join
+from scipy.ndimage.morphology import binary_dilation
+from torchvision.datasets import ImageFolder
 
 def get_argparse():
     parser = argparse.ArgumentParser()
@@ -62,6 +67,103 @@ transform_ae = transforms.RandomChoice([
 
 def train_transform(image):
     return default_transform(image), default_transform(transform_ae(image))
+
+class DefectDataset(Dataset):
+    def __init__(self, set='train', get_mask=True, get_features=True):
+        super(DefectDataset, self).__init__()
+        self.set = set
+        self.labels = list()
+        self.masks = list()
+        self.images = list()
+        self.depths = list()
+        self.class_names = ['good']
+        self.get_mask = get_mask
+        self.get_features = get_features
+        self.image_transforms = transforms.Compose([transforms.Resize((768, 768)), transforms.ToTensor(),
+                                                    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
+        root = join('./mvtec_anomaly_detection/', 'bottle')
+        set_dir = os.path.join(root, set)
+        subclass = os.listdir(set_dir)
+        subclass.sort()
+        class_counter = 1
+        for sc in subclass:
+            if sc == 'good':
+                label = 0
+            else:
+                label = class_counter
+                self.class_names.append(sc)
+                class_counter += 1
+            sub_dir = os.path.join(set_dir, sc)
+            img_dir = sub_dir
+            img_paths = os.listdir(img_dir)
+            img_paths.sort()
+            for p in img_paths:
+                i_path = os.path.join(img_dir, p)
+                if not i_path.lower().endswith(
+                        ('.jpg', '.jpeg', '.png', '.ppm', '.bmp', '.pgm', '.tif', '.tiff', '.webp')):
+                    continue
+                self.images.append(i_path)
+                self.labels.append(label)
+                if self.set == 'test' and self.get_mask:
+                    extension = '_mask' if sc != 'good' else ''
+                    mask_path = os.path.join(root, 'ground_truth', sc, p[:-4] + extension + p[-4:])
+                    self.masks.append(mask_path)
+
+
+        self.img_mean = torch.FloatTensor([0.485, 0.456, 0.406])[:, None, None]
+        self.img_std = torch.FloatTensor([0.229, 0.224, 0.225])[:, None, None]
+
+    def __len__(self):
+        return len(self.images)
+
+    def transform(self, x, img_len, binary=False):
+        x = x.copy()
+        x = torch.FloatTensor(x)
+        if len(x.shape) == 2:
+            x = x[None, None]
+            channels = 1
+        elif len(x.shape) == 3:
+            x = x.permute(2, 0, 1)[None]
+            channels = x.shape[1]
+        else:
+            raise Exception(f'invalid dimensions of x:{x.shape}')
+
+        x = downsampling(x, (img_len, img_len), bin=binary)
+        x = x.reshape(channels, img_len, img_len)
+        return x
+
+    def get_3D(self, index):
+        sample = np.load(self.depths[index])
+        depth = sample[:, :, 0]
+        fg = sample[:, :, -1]
+        mean_fg = np.sum(fg * depth) / np.sum(fg)
+        depth = fg * depth + (1 - fg) * mean_fg
+        depth = (depth - mean_fg) * 100
+        return depth, fg
+
+    def __getitem__(self, index):
+        depth = torch.zeros([1, 192, 192])
+        fg = torch.ones([1, 192, 192])
+
+        if self.set == 'test' or not self.get_features:
+            with open(self.images[index], 'rb') as f:
+                img = Image.open(f).convert('RGB')
+            img = self.image_transforms(img)
+        else:
+            img = 0
+
+        label = self.labels[index]
+        feat = self.features[index] if self.get_features else 0
+
+        ret = [depth, fg, label, img, feat]
+
+        if self.set == 'test' and self.get_mask:
+            with open(self.masks[index], 'rb') as f:
+                mask = Image.open(f)
+                mask = self.transform(np.array(mask), 192, binary=True)[:1]
+                mask[mask > 0] = 1
+                ret.append(mask)
+        return ret
 
 class FeatureExtractor(nn.Module):
     def __init__(self, layer_idx=35):
@@ -286,6 +388,7 @@ def main():
     max_nll_obs = Score_Observer('AUROC  max over maps')
     teacherv2.train()
     train_loss = list()
+    trail_loader_v2 = DataLoader(DefectDataset(set='train', get_mask=False, get_features=False), pin_memory=True, batch_size=8, shuffle=True, drop_last=True)
     # -----------------------------
 
     if on_gpu:
