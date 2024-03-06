@@ -571,29 +571,82 @@ def main():
     max_st_obs = Score_Observer('AUROC  max over maps')
     mean_st_obs = Score_Observer('AUROC mean over maps')
 
-    studentv2.train()
-    train_loss = list()
-    for i, data in enumerate(tqdm(train_loader_v2, disable=False)):
-        optimizerv2.zero_grad()
-        depth, fg, labels, image, features = data
-        depth, fg, image, features = [t.to('cuda') for t in [depth, fg, image, features]]
+    for epoch in range(1):
+        studentv2.train()
+        print(F'\nTrain epoch {epoch}')
+        for sub_epoch in range(1):
+            train_loss = list()
+            for i, data in enumerate(tqdm(train_loader_v2, disable=False)):
+                optimizerv2.zero_grad()
+                depth, fg, labels, image, features = data
+                depth, fg, image, features = [t.to('cuda') for t in [depth, fg, image, features]]
 
-        fg_down = downsampling(fg, (24, 24), bin=False)
+                fg_down = downsampling(fg, (24, 24), bin=False)
 
-        with torch.no_grad():
+                with torch.no_grad():
+                    z_t, jac_t = teacherv2(image, depth)
+
+                z, jac = studentv2(image, depth)
+                loss = get_st_loss(z_t, z, fg_down)
+                loss.backward()
+                # Update the student model parameters.
+                optimizerv2.step()
+
+                # Store the loss for this batch.
+                train_loss.append(t2np(loss))
+
+            mean_train_loss = np.mean(train_loss)
+            print('Epoch: {:d}.{:d} \t student train loss: {:.4f}'.format(epoch, sub_epoch, mean_train_loss))
+
+    studentv2.eval()
+    test_loss = list()
+    test_labels = list()
+    mean_st = list()
+    max_st = list()
+
+    with torch.no_grad():
+        for i, data in enumerate(tqdm(test_loader_v2, disable=False)):
+            # Move data to the configured device.
+            depth, fg, labels, image, features = data
+            depth, fg, image, features = [t.to('cuda') for t in [depth, fg, image, features]]
+
+            fg_down = downsampling(fg, (24, 24), bin=False)
+            # Teacher predictions for comparison.
             z_t, jac_t = teacherv2(image, depth)
 
-        z, jac = studentv2(image, depth)
-        loss = get_st_loss(z_t, z, fg_down)
-        loss.backward()
-        # Update the student model parameters.
-        optimizerv2.step()
+            # Student predictions.
+            z, jac = studentv2(image, depth)
 
-        # Store the loss for this batch.
-        train_loss.append(t2np(loss))
+            # Calculate loss for the student based on its difference from the teacher.
+            st_loss = get_st_loss(z_t, z, fg_down, per_sample=True)
+            # Per-pixel loss for detailed evaluation.
+            st_pixel = get_st_loss(z_t, z, fg_down, per_pixel=True)
 
-    mean_train_loss = np.mean(train_loss)
-    print('Epoch: {:d}.{:d} \t student train loss: {:.4f}'.format(1, 1, mean_train_loss))
+            # Store mean loss for evaluation.
+            mean_st.append(t2np(st_loss))
+            # Store max loss for evaluation.
+            max_st.append(np.max(t2np(st_pixel), axis=(1, 2)))
+            # Accumulate test loss.
+            test_loss.append(st_loss.mean().item())
+            # Store labels for AUROC calculation.
+            test_labels.append(labels)
+    # Flatten list of mean student losses.
+    mean_st = np.concatenate(mean_st)
+    # Flatten list of max student losses.
+    max_st = np.concatenate(max_st)
+    # Calculate mean test loss.
+    test_loss = np.mean(np.array(test_loss))
+
+    print('Epoch: {:d} \t student test_loss: {:.4f}'.format(1, test_loss))
+
+    # Flatten list of test labels.
+    test_labels = np.concatenate(test_labels)
+    # Convert labels to binary anomaly indicator.
+    is_anomaly = np.array([0 if l == 0 else 1 for l in test_labels])
+
+    # TODO: Add roc auc calculations, save the model, return roc auc calculations
+    # TODO: Add calculations for mean and max scores from utils.train_dataset function
+    # TODO: extract everything to a separate class
     # ---------------------
 
     if on_gpu:
