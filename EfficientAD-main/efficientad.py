@@ -403,37 +403,41 @@ def main():
     # Observers to track AUROC scores during training.
     mean_nll_obs = Score_Observer('AUROC mean over maps')
     max_nll_obs = Score_Observer('AUROC  max over maps')
-    teacherv2.train()
-    train_loss = list()
-    train_loader_v2 = DataLoader(DefectDataset(set='train', get_mask=False, get_features=False), pin_memory=True, batch_size=8, shuffle=True, drop_last=True)
-    test_loader_v2 = DataLoader(DefectDataset(set='test', get_mask=False, get_features=False), pin_memory=True, batch_size=16, shuffle=False, drop_last=False)
 
-    for i, data in enumerate(tqdm(train_loader_v2, disable=False)):
-        # Clear gradients.
-        optimizerv2.zero_grad()
+    for epoch in range(3):
+        teacherv2.train()
+        print(F'\nTrain epoch {epoch}')
+        for sub_epoch in range(24):
+            train_loss = list()
+            train_loader_v2 = DataLoader(DefectDataset(set='train', get_mask=False, get_features=False), pin_memory=True, batch_size=8, shuffle=True, drop_last=True)
+            test_loader_v2 = DataLoader(DefectDataset(set='test', get_mask=False, get_features=False), pin_memory=True, batch_size=16, shuffle=False, drop_last=False)
 
-        # Unpack data and move to device.
-        depth, fg, labels, image, features = data
-        depth, fg, labels, image, features = [t.to('cuda') for t in [depth, fg, labels, image, features]]
+            for i, data in enumerate(tqdm(train_loader_v2, disable=False)):
+                # Clear gradients.
+                optimizerv2.zero_grad()
 
-        # Downsample foreground mask to match the model output size.
-        fg_down = downsampling(fg, (24, 24), bin=False)
-        # Forward pass through the model.
-        z, jac = teacherv2(image, depth)
+                # Unpack data and move to device.
+                depth, fg, labels, image, features = data
+                depth, fg, labels, image, features = [t.to('cuda') for t in [depth, fg, labels, image, features]]
 
-        # Calculate loss and backpropagate.
-        loss = get_nf_loss(z, jac, fg_down)
-        # Convert tensor loss to numpy and store.
-        train_loss.append(t2np(loss))
+                # Downsample foreground mask to match the model output size.
+                fg_down = downsampling(fg, (24, 24), bin=False)
+                # Forward pass through the model.
+                z, jac = teacherv2(image, depth)
 
-        # Compute gradients.
-        loss.backward()
-        # Update model parameters.
-        optimizerv2.step()
+                # Calculate loss and backpropagate.
+                loss = get_nf_loss(z, jac, fg_down)
+                # Convert tensor loss to numpy and store.
+                train_loss.append(t2np(loss))
 
-    # Calculate mean training loss for the epoch.
-    mean_train_loss = np.mean(train_loss)
-    print('Epoch: {:d}.{:d} \t train loss: {:.4f}'.format(1, 1, mean_train_loss))
+                # Compute gradients.
+                loss.backward()
+                # Update model parameters.
+                optimizerv2.step()
+
+            # Calculate mean training loss for the epoch.
+            mean_train_loss = np.mean(train_loss)
+            print('Epoch: {:d}.{:d} \t train loss: {:.4f}'.format(epoch, sub_epoch, mean_train_loss))
 
     teacherv2.eval()
     test_loss = list()
