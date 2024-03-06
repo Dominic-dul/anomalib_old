@@ -196,10 +196,10 @@ def get_nf(input_dim=304, channels_hidden=64):
         nodes.append(Node([nodes[-1].out0], permute_layer, {'seed': k}, name=F'permute_{k}'))
         # Conditional coupling layer if positional encoding is used.
         nodes.append(Node([nodes[-1].out0], glow_coupling_layer_cond,
-                          {'clamp': c.clamp,
+                          {'clamp': 1.9,
                            'F_class': F_conv,
                            'F_args': {'channels_hidden': channels_hidden,
-                                      'kernel_size': c.kernel_sizes[k]}},
+                                      'kernel_size': kernel_sizes[k]}},
                           name=F'conv_{k}'))
     # Output node.
     nodes.append(OutputNode([nodes[-1].out0], name='output'))
@@ -284,7 +284,7 @@ class Score_Observer:
 
 def downsampling(x, size, to_tensor=False, bin=True):
     if to_tensor:
-        x = torch.FloatTensor(x).to(c.device)
+        x = torch.FloatTensor(x).to('cuda')
     down = F.interpolate(x, size=size, mode='bilinear', align_corners=False)
     if bin:
         down[down > 0] = 1
@@ -406,6 +406,7 @@ def main():
     teacherv2.train()
     train_loss = list()
     train_loader_v2 = DataLoader(DefectDataset(set='train', get_mask=False, get_features=False), pin_memory=True, batch_size=8, shuffle=True, drop_last=True)
+    test_loader_v2 = DataLoader(DefectDataset(set='test', get_mask=False, get_features=False), pin_memory=True, batch_size=16, shuffle=False, drop_last=False)
 
     for i, data in enumerate(tqdm(train_loader_v2, disable=False)):
         # Clear gradients.
@@ -433,6 +434,42 @@ def main():
     # Calculate mean training loss for the epoch.
     mean_train_loss = np.mean(train_loss)
     print('Epoch: {:d}.{:d} \t train loss: {:.4f}'.format(1, 1, mean_train_loss))
+
+    teacherv2.eval()
+    test_loss = list()
+    test_labels = list()
+    img_nll = list()
+    max_nlls = list()
+
+    with torch.no_grad():
+        for i, data in enumerate(tqdm(test_loader_v2, disable=False)):
+            # Unpack and move data to device, similar to training phase.
+            depth, fg, labels, image, features = data
+            depth, fg, image, features = [t.to('cuda') for t in [depth, fg, image, features]]
+
+            fg_down = downsampling(fg, (24, 24), bin=False)
+            z, jac = teacherv2(image, depth)
+            # Calculate loss for each sample.
+            loss = get_nf_loss(z, jac, fg_down, per_sample=True)
+            # Calculate per-pixel loss.
+            nll = get_nf_loss(z, jac, fg_down, per_pixel=True)
+
+            img_nll.append(t2np(loss))
+            # Track max loss over all pixels.
+            max_nlls.append(np.max(t2np(nll), axis=(-1, -2)))
+            # Calculate mean test loss.
+            test_loss.append(loss.mean().item())
+            test_labels.append(labels)
+
+    img_nll = np.concatenate(img_nll)
+    max_nlls = np.concatenate(max_nlls)
+    test_loss = np.mean(np.array(test_loss))
+
+    print('Epoch: {:d} \t test_loss: {:.4f}'.format(1, test_loss))
+
+    test_labels = np.concatenate(test_labels)
+    # Prepare anomaly labels.
+    is_anomaly = np.array([0 if l == 0 else 1 for l in test_labels])
     # -----------------------------
 
     if on_gpu:
