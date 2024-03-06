@@ -363,11 +363,22 @@ def t2np(tensor):
     return tensor.cpu().data.numpy() if tensor is not None else None
 
 def get_nf_loss(z, jac, mask=None, per_sample=False, per_pixel=False):
-    if not False:
-        mask = 0 * mask + 1
+    mask = 0 * mask + 1
     loss_per_pixel = (0.5 * torch.sum(mask * z ** 2, dim=1) - jac * mask[:, 0])
     if per_pixel:
         return loss_per_pixel
+    loss_per_sample = torch.mean(loss_per_pixel, dim=(-1, -2))
+    if per_sample:
+        return loss_per_sample
+    return loss_per_sample.mean()
+
+def get_st_loss(target, output, mask=None, per_sample=False, per_pixel=False):
+    mask = 0 * mask + 1
+
+    loss_per_pixel = torch.mean(mask * (target - output) ** 2, dim=1)
+    if per_pixel:
+        return loss_per_pixel
+
     loss_per_sample = torch.mean(loss_per_pixel, dim=(-1, -2))
     if per_sample:
         return loss_per_sample
@@ -465,6 +476,11 @@ def main():
     autoencoder.train()
 
     # ast teacher model training and validation ---------------------------
+    train_loader_v2 = DataLoader(DefectDataset(set='train', get_mask=False, get_features=False), pin_memory=True,
+                                 batch_size=8, shuffle=True, drop_last=True)
+    test_loader_v2 = DataLoader(DefectDataset(set='test', get_mask=False, get_features=False), pin_memory=True,
+                                batch_size=16, shuffle=False, drop_last=False)
+
     teacherv2 = StudentTeacherModel()
     teacherv2.to('cuda')
     optimizerv2 = torch.optim.Adam(teacherv2.net.parameters(), lr=2e-4, eps=1e-08, weight_decay=1e-5)
@@ -477,9 +493,6 @@ def main():
         print(F'\nTrain epoch {epoch}')
         for sub_epoch in range(1):
             train_loss = list()
-            train_loader_v2 = DataLoader(DefectDataset(set='train', get_mask=False, get_features=False), pin_memory=True, batch_size=8, shuffle=True, drop_last=True)
-            test_loader_v2 = DataLoader(DefectDataset(set='test', get_mask=False, get_features=False), pin_memory=True, batch_size=16, shuffle=False, drop_last=False)
-
             for i, data in enumerate(tqdm(train_loader_v2, disable=False)):
                 # Clear gradients.
                 optimizerv2.zero_grad()
@@ -505,7 +518,7 @@ def main():
 
             # Calculate mean training loss for the epoch.
             mean_train_loss = np.mean(train_loss)
-            print('Epoch: {:d}.{:d} \t train loss: {:.4f}'.format(epoch, sub_epoch, mean_train_loss))
+            print('Epoch: {:d}.{:d} \t teacher train loss: {:.4f}'.format(epoch, sub_epoch, mean_train_loss))
 
     teacherv2.eval()
     test_loss = list()
@@ -537,7 +550,7 @@ def main():
     max_nlls = np.concatenate(max_nlls)
     test_loss = np.mean(np.array(test_loss))
 
-    print('Epoch: {:d} \t test_loss: {:.4f}'.format(1, test_loss))
+    print('Epoch: {:d} \t teacher test_loss: {:.4f}'.format(1, test_loss))
 
     test_labels = np.concatenate(test_labels)
     # Prepare anomaly labels.
@@ -545,8 +558,42 @@ def main():
     # TODO: Add roc auc calculations, save the model, return roc auc calculations
     # TODO: Add calculations for mean and max scores from utils.train_dataset function
     # ast student model training and validation ---------------------------
+    train_loader_v2 = DataLoader(DefectDataset(set='train', get_mask=False, get_features=False), pin_memory=True,
+                                 batch_size=8, shuffle=True, drop_last=True)
+    test_loader_v2 = DataLoader(DefectDataset(set='test', get_mask=False, get_features=False), pin_memory=True,
+                                batch_size=16, shuffle=False, drop_last=False)
     studentv2 = StudentTeacherModel(nf=False, channels_hidden=1024, n_blocks=4)
     studentv2.to('cuda')
+
+    # TODO: load a created teacher
+    optimizerv2 = torch.optim.Adam(studentv2.net.parameters(), lr=2e-4, eps=1e-08, weight_decay=1e-5)
+
+    max_st_obs = Score_Observer('AUROC  max over maps')
+    mean_st_obs = Score_Observer('AUROC mean over maps')
+
+    studentv2.train()
+    train_loss = list()
+    for i, data in enumerate(tqdm(train_loader_v2, disable=False)):
+        optimizerv2.zero_grad()
+        depth, fg, labels, image, features = data
+        depth, fg, image, features = [t.to('cuda') for t in [depth, fg, image, features]]
+
+        fg_down = downsampling(fg, (24, 24), bin=False)
+
+        with torch.no_grad():
+            z_t, jac_t = teacherv2(image, depth)
+
+        z, jac = studentv2(image, depth)
+        loss = get_st_loss(z_t, z, fg_down)
+        loss.backward()
+        # Update the student model parameters.
+        optimizerv2.step()
+
+        # Store the loss for this batch.
+        train_loss.append(t2np(loss))
+
+    mean_train_loss = np.mean(train_loss)
+    print('Epoch: {:d}.{:d} \t student train loss: {:.4f}'.format(1, 1, mean_train_loss))
     # ---------------------
 
     if on_gpu:
