@@ -396,7 +396,7 @@ def main():
     student.train()
     autoencoder.train()
 
-    # ast teacher model ---------------------------
+    # ast teacher model training and validation ---------------------------
     teacherv2 = TeacherModel()
     teacherv2.to('cuda')
     optimizerv2 = torch.optim.Adam(teacherv2.net.parameters(), lr=2e-4, eps=1e-08, weight_decay=1e-5)
@@ -474,7 +474,10 @@ def main():
     test_labels = np.concatenate(test_labels)
     # Prepare anomaly labels.
     is_anomaly = np.array([0 if l == 0 else 1 for l in test_labels])
-    # -----------------------------
+    # TODO: Add roc auc calculations, save the model, return roc auc calculations
+    # TODO: Add calculations for mean and max scores from utils.train_dataset function
+    # ast student model training and validation ---------------------------
+    # ---------------------
 
     if on_gpu:
         teacher.cuda()
