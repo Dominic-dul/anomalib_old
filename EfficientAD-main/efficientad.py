@@ -186,10 +186,8 @@ class FeatureExtractor(nn.Module):
                 return x
 
 # Function to create a normalizing flow model for the teacher.
-def get_nf(input_dim=368, channels_hidden=64):
+def get_nf(input_dim=304, channels_hidden=64):
     nodes = list()
-    # If positional encoding is enabled, add an input node for it.
-    nodes.append(InputNode(32, name='input'))
     # Main input node.
     nodes.append(InputNode(input_dim, name='input'))
     # Creating coupling blocks.
@@ -197,12 +195,11 @@ def get_nf(input_dim=368, channels_hidden=64):
     for k in range(4):
         nodes.append(Node([nodes[-1].out0], permute_layer, {'seed': k}, name=F'permute_{k}'))
         # Conditional coupling layer if positional encoding is used.
-        nodes.append(Node([nodes[-1].out0, nodes[0].out0], glow_coupling_layer_cond,
-                          {'clamp': 1.9,
+        nodes.append(Node([nodes[-1].out0], glow_coupling_layer_cond,
+                          {'clamp': c.clamp,
                            'F_class': F_conv,
-                           'cond_dim': 32,
                            'F_args': {'channels_hidden': channels_hidden,
-                                      'kernel_size': kernel_sizes[k]}},
+                                      'kernel_size': c.kernel_sizes[k]}},
                           name=F'conv_{k}'))
     # Output node.
     nodes.append(OutputNode([nodes[-1].out0], name='output'))
@@ -241,7 +238,6 @@ class TeacherModel(nn.Module):
         self.feature_extractor = FeatureExtractor()
         self.net = get_nf()
         # Positional encoding initialization if enabled.
-        self.pos_enc = positionalencoding2d(32, 384, 384)
 
         # Unshuffle operation for processing depth information.
         self.unshuffle = nn.PixelUnshuffle(8)
@@ -254,8 +250,7 @@ class TeacherModel(nn.Module):
         inp = f
 
         # Processing through the network with positional encoding.
-        cond = self.pos_enc.tile(inp.shape[0], 1, 1, 1)
-        z = self.net([cond, inp])
+        z = self.net(inp)
 
         # Calculating the Jacobian for the normalizing flow.
         jac = self.net.jacobian(run_forward=False)[0]
