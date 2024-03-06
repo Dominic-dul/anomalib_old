@@ -231,12 +231,80 @@ def positionalencoding2d(D, H, W):
     # Returns the positional encoding.
     return P.to('cuda')[None]
 
-class TeacherModel(nn.Module):
-    def __init__(self):
-        super(TeacherModel, self).__init__()
+class res_block(nn.Module):
+    def __init__(self, channels):
+        super(res_block, self).__init__()
+        # First convolution layer to process the input tensor
+        self.l1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        # Second convolution layer for further processing
+        self.l2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
+        # Activation function to introduce non-linearity
+        self.act = nn.LeakyReLU()
+        # Batch normalization to stabilize and speed up training
+        self.bn1 = nn.BatchNorm2d(channels)
+        # Second batch normalization for the second convolution layer
+        self.bn2 = nn.BatchNorm2d(channels)
+
+    def forward(self, x):
+        # Store the original input for the residual connection
+        inp = x
+        # First layer processing
+        x = self.l1(x)
+        x = self.bn1(x)
+        x = self.act(x)
+
+        # Second layer processing
+        x = self.l2(x)
+        x = self.bn2(x)
+        x = self.act(x)
+        # Adding the input back to the output (residual connection)
+        x = x + inp
+        return x
+
+# The student model consisting of convolutional layers and residual blocks.
+class Student(nn.Module):
+    def __init__(self, channels_hidden=1024, n_blocks=4):
+        super(Student, self).__init__()
+        # Calculate input features, adjust for positional encoding if used
+        inp_feat = 304
+        # Initial convolution layer to adapt the input feature size
+        self.conv1 = nn.Conv2d(inp_feat, channels_hidden, kernel_size=3, padding=1)
+        # Final convolution layer to produce the output feature map
+        self.conv2 = nn.Conv2d(channels_hidden, 304, kernel_size=3, padding=1)
+        # Initialize the residual blocks
+        self.res = list()
+        # Initializing residual blocks.
+        for _ in range(n_blocks):
+            self.res.append(res_block(channels_hidden))
+        self.res = nn.ModuleList(self.res)
+        # Learnable scaling parameter for the output
+        self.gamma = nn.Parameter(torch.zeros(1))
+        # Activation function for non-linearity
+        self.act = nn.LeakyReLU()
+
+    def forward(self, x):
+        # Process input through the initial convolution layer
+        x = self.act(self.conv1(x))
+        # Pass the output through each residual block
+        for i in range(len(self.res)):
+            x = self.res[i](x)
+
+        # Final convolution to produce the output feature map
+        x = self.conv2(x)
+        return x
+
+    def jacobian(self, run_forward=False):
+        return [0] # Placeholder for Jacobian computation, not applicable for student model.
+
+class StudentTeacherModel(nn.Module):
+    def __init__(self, nf=False, n_blocks=4, channels_hidden=64):
+        super(StudentTeacherModel, self).__init__()
 
         self.feature_extractor = FeatureExtractor()
-        self.net = get_nf()
+        if nf:
+            self.net = get_nf()
+        else:
+            self.net = Student(channels_hidden=channels_hidden, n_blocks=n_blocks)
         # Positional encoding initialization if enabled.
 
         # Unshuffle operation for processing depth information.
@@ -397,17 +465,17 @@ def main():
     autoencoder.train()
 
     # ast teacher model training and validation ---------------------------
-    teacherv2 = TeacherModel()
+    teacherv2 = StudentTeacherModel()
     teacherv2.to('cuda')
     optimizerv2 = torch.optim.Adam(teacherv2.net.parameters(), lr=2e-4, eps=1e-08, weight_decay=1e-5)
     # Observers to track AUROC scores during training.
     mean_nll_obs = Score_Observer('AUROC mean over maps')
     max_nll_obs = Score_Observer('AUROC  max over maps')
 
-    for epoch in range(3):
+    for epoch in range(1):
         teacherv2.train()
         print(F'\nTrain epoch {epoch}')
-        for sub_epoch in range(24):
+        for sub_epoch in range(1):
             train_loss = list()
             train_loader_v2 = DataLoader(DefectDataset(set='train', get_mask=False, get_features=False), pin_memory=True, batch_size=8, shuffle=True, drop_last=True)
             test_loader_v2 = DataLoader(DefectDataset(set='test', get_mask=False, get_features=False), pin_memory=True, batch_size=16, shuffle=False, drop_last=False)
@@ -477,6 +545,8 @@ def main():
     # TODO: Add roc auc calculations, save the model, return roc auc calculations
     # TODO: Add calculations for mean and max scores from utils.train_dataset function
     # ast student model training and validation ---------------------------
+    studentv2 = StudentTeacherModel(nf=False, channels_hidden=1024, n_blocks=4)
+    studentv2.to('cuda')
     # ---------------------
 
     if on_gpu:
