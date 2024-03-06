@@ -4,8 +4,8 @@ device = 'cuda' # or 'cpu'
 # data settings
 dataset_dir = '/path/to/your/dataset/' # parent directory of class folders
 feature_dir = 'data/features/' # directory where features are stored and loaded from
-use_3D_dataset = True # is MVTec 3D used?
-pre_extracted = True # were feature pre-extracted with extract_features? (recommended)
+use_3D_dataset = False # is MVTec 3D used?
+pre_extracted = False # were feature pre-extracted with extract_features? (recommended)
 modelname = "my_experiment" # export evaluations/logs with this name
 print(modelname)
 
@@ -31,7 +31,7 @@ training_mask = (mode != 'RGB') # use foreground mask for training?
 eval_mask = (mode != 'RGB') # use foreground mask for evaluation?
 
 # 3D settings
-dilate_mask = True
+dilate_mask = False
 dilate_size = 8
 n_fills = 3
 bg_thresh = 7e-3

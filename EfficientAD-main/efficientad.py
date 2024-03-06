@@ -251,7 +251,7 @@ class TeacherModel(nn.Module):
         with torch.no_grad():
             f = self.feature_extractor(x)
 
-        inp = torch.cat([f, self.unshuffle(depth)], dim=1)
+        inp = f
 
         # Processing through the network with positional encoding.
         cond = self.pos_enc.tile(inp.shape[0], 1, 1, 1)
