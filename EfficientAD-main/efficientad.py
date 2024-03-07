@@ -385,97 +385,13 @@ def get_st_loss(target, output, mask=None, per_sample=False, per_pixel=False):
     return loss_per_sample.mean()
 
 def main():
+    # ast teacher model training and validation ---------------------------
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
 
-    config = get_argparse()
+    pretrain_penalty = False
 
-    if config.dataset == 'mvtec_ad':
-        dataset_path = config.mvtec_ad_path
-    elif config.dataset == 'mvtec_loco':
-        dataset_path = config.mvtec_loco_path
-    else:
-        raise Exception('Unknown config.dataset')
-
-    pretrain_penalty = True
-    if config.imagenet_train_path == 'none':
-        pretrain_penalty = False
-
-    # create output dir
-    train_output_dir = os.path.join(config.output_dir, 'trainings',
-                                    config.dataset, config.subdataset)
-    test_output_dir = os.path.join(config.output_dir, 'anomaly_maps',
-                                   config.dataset, config.subdataset, 'test')
-    os.makedirs(train_output_dir)
-    os.makedirs(test_output_dir)
-
-    # load data
-    full_train_set = ImageFolderWithoutTarget(
-        os.path.join(dataset_path, config.subdataset, 'train'),
-        transform=transforms.Lambda(train_transform))
-    test_set = ImageFolderWithPath(
-        os.path.join(dataset_path, config.subdataset, 'test'))
-    if config.dataset == 'mvtec_ad':
-        # mvtec dataset paper recommend 10% validation set
-        train_size = int(0.9 * len(full_train_set))
-        validation_size = len(full_train_set) - train_size
-        rng = torch.Generator().manual_seed(seed)
-        train_set, validation_set = torch.utils.data.random_split(full_train_set,
-                                                           [train_size,
-                                                            validation_size],
-                                                           rng)
-    elif config.dataset == 'mvtec_loco':
-        train_set = full_train_set
-        validation_set = ImageFolderWithoutTarget(
-            os.path.join(dataset_path, config.subdataset, 'validation'),
-            transform=transforms.Lambda(train_transform))
-    else:
-        raise Exception('Unknown config.dataset')
-
-
-    train_loader = DataLoader(train_set, batch_size=1, shuffle=True,
-                              num_workers=4, pin_memory=True)
-    train_loader_infinite = InfiniteDataloader(train_loader)
-    validation_loader = DataLoader(validation_set, batch_size=1)
-
-    if pretrain_penalty:
-        # load pretraining data for penalty
-        penalty_transform = transforms.Compose([
-            transforms.Resize((2 * image_size, 2 * image_size)),
-            transforms.RandomGrayscale(0.3),
-            transforms.CenterCrop(image_size),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224,
-                                                                  0.225])
-        ])
-        penalty_set = ImageFolderWithoutTarget(config.imagenet_train_path,
-                                               transform=penalty_transform)
-        penalty_loader = DataLoader(penalty_set, batch_size=1, shuffle=True,
-                                    num_workers=4, pin_memory=True)
-        penalty_loader_infinite = InfiniteDataloader(penalty_loader)
-    else:
-        penalty_loader_infinite = itertools.repeat(None)
-
-    # create models
-    if config.model_size == 'small':
-        teacher = get_pdn_small(out_channels)
-        student = get_pdn_small(2 * out_channels)
-    elif config.model_size == 'medium':
-        teacher = get_pdn_medium(out_channels)
-        student = get_pdn_medium(2 * out_channels)
-    else:
-        raise Exception()
-    state_dict = torch.load(config.weights, map_location='cpu')
-    teacher.load_state_dict(state_dict)
-    autoencoder = get_autoencoder(out_channels)
-
-    # teacher frozen
-    teacher.eval()
-    student.train()
-    autoencoder.train()
-
-    # ast teacher model training and validation ---------------------------
     train_loader_v2 = DataLoader(DefectDataset(set='train', get_mask=False, get_features=False), pin_memory=True,
                                  batch_size=8, shuffle=True, drop_last=True)
     test_loader_v2 = DataLoader(DefectDataset(set='test', get_mask=False, get_features=False), pin_memory=True,
@@ -565,6 +481,12 @@ def main():
     studentv2 = StudentTeacherModel(nf=False, channels_hidden=1024, n_blocks=4)
     studentv2.to('cuda')
 
+    autoencoderv2 = get_autoencoder(304)
+    autoencoderv2.train()
+    autoencoderv2.cuda()
+
+    teacher_mean, teacher_std = teacher_normalizationv2(teacherv2, train_loader_v2)
+
     # TODO: load a created teacher
     optimizerv2 = torch.optim.Adam(studentv2.net.parameters(), lr=2e-4, eps=1e-08, weight_decay=1e-5)
 
@@ -648,6 +570,95 @@ def main():
     # TODO: Add calculations for mean and max scores from utils.train_dataset function
     # TODO: extract everything to a separate class
     # ---------------------
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+
+    config = get_argparse()
+
+    if config.dataset == 'mvtec_ad':
+        dataset_path = config.mvtec_ad_path
+    elif config.dataset == 'mvtec_loco':
+        dataset_path = config.mvtec_loco_path
+    else:
+        raise Exception('Unknown config.dataset')
+
+    pretrain_penalty = True
+    if config.imagenet_train_path == 'none':
+        pretrain_penalty = False
+
+    # create output dir
+    train_output_dir = os.path.join(config.output_dir, 'trainings',
+                                    config.dataset, config.subdataset)
+    test_output_dir = os.path.join(config.output_dir, 'anomaly_maps',
+                                   config.dataset, config.subdataset, 'test')
+    os.makedirs(train_output_dir)
+    os.makedirs(test_output_dir)
+
+    # load data
+    full_train_set = ImageFolderWithoutTarget(
+        os.path.join(dataset_path, config.subdataset, 'train'),
+        transform=transforms.Lambda(train_transform))
+    test_set = ImageFolderWithPath(
+        os.path.join(dataset_path, config.subdataset, 'test'))
+    if config.dataset == 'mvtec_ad':
+        # mvtec dataset paper recommend 10% validation set
+        train_size = int(0.9 * len(full_train_set))
+        validation_size = len(full_train_set) - train_size
+        rng = torch.Generator().manual_seed(seed)
+        train_set, validation_set = torch.utils.data.random_split(full_train_set,
+                                                           [train_size,
+                                                            validation_size],
+                                                           rng)
+    elif config.dataset == 'mvtec_loco':
+        train_set = full_train_set
+        validation_set = ImageFolderWithoutTarget(
+            os.path.join(dataset_path, config.subdataset, 'validation'),
+            transform=transforms.Lambda(train_transform))
+    else:
+        raise Exception('Unknown config.dataset')
+
+
+    train_loader = DataLoader(train_set, batch_size=1, shuffle=True,
+                              num_workers=4, pin_memory=True)
+    train_loader_infinite = InfiniteDataloader(train_loader)
+    validation_loader = DataLoader(validation_set, batch_size=1)
+
+    if pretrain_penalty:
+        # load pretraining data for penalty
+        penalty_transform = transforms.Compose([
+            transforms.Resize((2 * image_size, 2 * image_size)),
+            transforms.RandomGrayscale(0.3),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224,
+                                                                  0.225])
+        ])
+        penalty_set = ImageFolderWithoutTarget(config.imagenet_train_path,
+                                               transform=penalty_transform)
+        penalty_loader = DataLoader(penalty_set, batch_size=1, shuffle=True,
+                                    num_workers=4, pin_memory=True)
+        penalty_loader_infinite = InfiniteDataloader(penalty_loader)
+    else:
+        penalty_loader_infinite = itertools.repeat(None)
+
+    # create models
+    if config.model_size == 'small':
+        teacher = get_pdn_small(out_channels)
+        student = get_pdn_small(2 * out_channels)
+    elif config.model_size == 'medium':
+        teacher = get_pdn_medium(out_channels)
+        student = get_pdn_medium(2 * out_channels)
+    else:
+        raise Exception()
+    state_dict = torch.load(config.weights, map_location='cpu')
+    teacher.load_state_dict(state_dict)
+    autoencoder = get_autoencoder(out_channels)
+
+    # teacher frozen
+    teacher.eval()
+    student.train()
+    autoencoder.train()
 
     if on_gpu:
         teacher.cuda()
@@ -854,6 +865,35 @@ def teacher_normalization(teacher, train_loader):
         if on_gpu:
             train_image = train_image.cuda()
         teacher_output = teacher(train_image)
+        distance = (teacher_output - channel_mean) ** 2
+        mean_distance = torch.mean(distance, dim=[0, 2, 3])
+        mean_distances.append(mean_distance)
+    channel_var = torch.mean(torch.stack(mean_distances), dim=0)
+    channel_var = channel_var[None, :, None, None]
+    channel_std = torch.sqrt(channel_var)
+
+    return channel_mean, channel_std
+
+@torch.no_grad()
+def teacher_normalizationv2(teacher, train_loader):
+
+    mean_outputs = []
+    for i, data in enumerate(tqdm(train_loader, desc='Computing mean of features')):
+        depth, fg, labels, image, features = data
+        depth, fg, image, features = [t.to('cuda') for t in [depth, fg, image, features]]
+
+        teacher_output, _ = teacher(image, depth)
+        mean_output = torch.mean(teacher_output, dim=[0, 2, 3])
+        mean_outputs.append(mean_output)
+    channel_mean = torch.mean(torch.stack(mean_outputs), dim=0)
+    channel_mean = channel_mean[None, :, None, None]
+
+    mean_distances = []
+    for i, data in enumerate(tqdm(train_loader, desc='Computing std of features')):
+        depth, fg, labels, image, features = data
+        depth, fg, image, features = [t.to('cuda') for t in [depth, fg, image, features]]
+
+        teacher_output, _ = teacher(image, depth)
         distance = (teacher_output - channel_mean) ** 2
         mean_distance = torch.mean(distance, dim=[0, 2, 3])
         mean_distances.append(mean_distance)
