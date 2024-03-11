@@ -138,9 +138,8 @@ class DefectDataset(Dataset):
             img = 0
 
         label = self.labels[index]
-        feat = self.features[index] if self.get_features else 0
 
-        ret = [fg, label, img, feat]
+        ret = [fg, label, img]
         return ret
 
 #TODO revisit to see if it is still needed
@@ -263,6 +262,7 @@ class StudentTeacherModel(nn.Module):
 
     def forward(self, x):
         # Feature extraction based on the mode and configuration.
+        # TODO figure out why feature extractor is used and not the image itself
         with torch.no_grad():
             f = self.feature_extractor(x)
 
@@ -276,31 +276,6 @@ class StudentTeacherModel(nn.Module):
         # Returning the transformed input and Jacobian.
         return z, jac
 
-class Score_Observer:
-    '''Keeps an eye on the current and highest score so far'''
-
-    def __init__(self, name, percentage=True):
-        self.name = name
-        self.max_epoch = 0
-        self.best_score = None
-        self.last_score = None
-        self.percentage = percentage
-
-    def update(self, score, epoch, print_score=False):
-        if self.percentage:
-            score = score * 100
-        self.last_score = score
-        improved = False
-        if epoch == 0 or score > self.best_score:
-            self.best_score = score
-            improved = True
-        if print_score:
-            self.print_score()
-        return improved
-
-    def print_score(self):
-        print('{:s}: \t last: {:.2f} \t best: {:.2f}'.format(self.name, self.last_score, self.best_score))
-
 def downsampling(x, size, to_tensor=False, bin=True):
     if to_tensor:
         x = torch.FloatTensor(x).to('cuda')
@@ -309,116 +284,20 @@ def downsampling(x, size, to_tensor=False, bin=True):
         down[down > 0] = 1
     return down
 
-def t2np(tensor):
-    '''pytorch tensor -> numpy array'''
-    return tensor.cpu().data.numpy() if tensor is not None else None
-
-def get_nf_loss(z, jac, mask=None, per_sample=False, per_pixel=False):
-    mask = 0 * mask + 1
-    loss_per_pixel = (0.5 * torch.sum(mask * z ** 2, dim=1) - jac * mask[:, 0])
-    if per_pixel:
-        return loss_per_pixel
-    loss_per_sample = torch.mean(loss_per_pixel, dim=(-1, -2))
-    if per_sample:
-        return loss_per_sample
-    return loss_per_sample.mean()
-
 def main():
-    # ast teacher model training and validation ---------------------------
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-    random.seed(seed)
-
-    pretrain_penalty = False
-
-    # TODO revisit to extract train set, validation set and test set
-    train_loader = DataLoader(DefectDataset(set='train', get_mask=False, get_features=False), pin_memory=True,
-                                 batch_size=8, shuffle=True, drop_last=True)
-    test_loader = DataLoader(DefectDataset(set='test', get_mask=False, get_features=False), pin_memory=True,
-                                batch_size=16, shuffle=False, drop_last=False)
-
     teacher = StudentTeacherModel(nf=True)
-    teacher.cuda()
-    optimizer = torch.optim.Adam(teacher.net.parameters(), lr=2e-4, eps=1e-08, weight_decay=1e-5)
-    # Observers to track AUROC scores during training.
-    mean_nll_obs = Score_Observer('AUROC mean over maps')
-    max_nll_obs = Score_Observer('AUROC  max over maps')
-
-    # TODO revisit to see whether it is being trained with efficientnet
-    for epoch in range(1):
-        teacher.train()
-        print(F'\nTrain epoch {epoch}')
-        for sub_epoch in range(1):
-            train_loss = list()
-            for i, data in enumerate(tqdm(train_loader, disable=False)):
-                # Clear gradients.
-                optimizer.zero_grad()
-
-                # Unpack data and move to device.
-                fg, labels, image, features = data
-                fg, labels, image, features = [t.to('cuda') for t in [fg, labels, image, features]]
-
-                # Downsample foreground mask to match the model output size.
-                fg_down = downsampling(fg, (24, 24), bin=False)
-                # Forward pass through the model.
-                z, jac = teacher(image)
-
-                # Calculate loss and backpropagate.
-                loss = get_nf_loss(z, jac, fg_down)
-                # Convert tensor loss to numpy and store.
-                train_loss.append(t2np(loss))
-
-                # Compute gradients.
-                loss.backward()
-                # Update model parameters.
-                optimizer.step()
-
-            # Calculate mean training loss for the epoch.
-            mean_train_loss = np.mean(train_loss)
-            print('Epoch: {:d}.{:d} \t teacher train loss: {:.4f}'.format(epoch, sub_epoch, mean_train_loss))
-
+    teacher.net.load_state_dict(torch.load('./models/teacher_nf_bottle.pth'))
     teacher.eval()
-    test_loss = list()
-    test_labels = list()
-    img_nll = list()
-    max_nlls = list()
-
-    with torch.no_grad():
-        for i, data in enumerate(tqdm(test_loader, disable=False)):
-            # Unpack and move data to device, similar to training phase.
-            fg, labels, image, features = data
-            fg, image, features = [t.to('cuda') for t in [fg, image, features]]
-
-            fg_down = downsampling(fg, (24, 24), bin=False)
-            z, jac = teacher(image)
-            # Calculate loss for each sample.
-            loss = get_nf_loss(z, jac, fg_down, per_sample=True)
-            # Calculate per-pixel loss.
-            nll = get_nf_loss(z, jac, fg_down, per_pixel=True)
-
-            img_nll.append(t2np(loss))
-            # Track max loss over all pixels.
-            max_nlls.append(np.max(t2np(nll), axis=(-1, -2)))
-            # Calculate mean test loss.
-            test_loss.append(loss.mean().item())
-            test_labels.append(labels)
-
-    img_nll = np.concatenate(img_nll)
-    max_nlls = np.concatenate(max_nlls)
-    test_loss = np.mean(np.array(test_loss))
-
-    print('Epoch: {:d} \t teacher test_loss: {:.4f}'.format(1, test_loss))
-
-    test_labels = np.concatenate(test_labels)
-    # Prepare anomaly labels.
-    is_anomaly = np.array([0 if l == 0 else 1 for l in test_labels])
-    # TODO: Add roc auc calculations, save the model, return roc auc calculations
-    # TODO: Add calculations for mean and max scores from utils.train_dataset function
-    # ast student model training and validation ---------------------------
-    # train_loader = DataLoader(DefectDataset(set='train', get_mask=False, get_features=False), pin_memory=True,
-    #                              batch_size=8, shuffle=True, drop_last=True)
-    # test_loader = DataLoader(DefectDataset(set='test', get_mask=False, get_features=False), pin_memory=True,
-    #                             batch_size=16, shuffle=False, drop_last=False)
+    teacher.cuda()
+    #TODO split train dataset into training and validation
+    full_train_set = DefectDataset(set='train', get_mask=False, get_features=False)
+    train_size = int(0.9 * len(full_train_set))
+    validation_size = len(full_train_set) - train_size
+    rng = torch.Generator().manual_seed(seed)
+    train_set, validation_set = torch.utils.data.random_split(full_train_set, [train_size, validation_size], rng)
+    train_loader = DataLoader(train_set, pin_memory=True, batch_size=8, shuffle=True, drop_last=True)
+    validation_loader = DataLoader(validation_set, pin_memory=True, batch_size=8)
+    test_loader = DataLoader(DefectDataset(set='test', get_mask=False, get_features=False), pin_memory=True, batch_size=1, shuffle=False, drop_last=False)
     student = StudentTeacherModel(nf=False, channels_hidden=608, n_blocks=4)
     student.train()
     student.cuda()
@@ -430,7 +309,6 @@ def main():
     teacher_mean, teacher_std = teacher_normalization(teacher, train_loader)
 
     train_steps = 2
-    # TODO: load a created teacher
     optimizer = torch.optim.Adam(itertools.chain(student.net.parameters(),
                                                  autoencoder.parameters()), lr=2e-4, eps=1e-08, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=int(0.95 * train_steps), gamma=0.1)
@@ -439,11 +317,11 @@ def main():
         train_loss = list()
         for i, data in enumerate(tqdm(train_loader, disable=False)):
             optimizer.zero_grad()
-            fg, labels, image, features = data
-            fg, image, features = [t.to('cuda') for t in [fg, image, features]]
+            fg, labels, image = data
+            fg, image = [t.to('cuda') for t in [fg, image]]
 
             # TODO revisit calculation of student loss using fg_down
-            fg_down = downsampling(fg, (24, 24), bin=False)
+            # fg_down = downsampling(fg, (24, 24), bin=False)
 
             with torch.no_grad():
                 teacher_output_st, _ = teacher(image)
@@ -479,17 +357,35 @@ def main():
 
     # TODO replace with validation loader
     q_st_start, q_st_end, q_ae_start, q_ae_end = map_normalization(
-        validation_loader=test_loader, teacher=teacher, student=student,
+        validation_loader=validation_loader, teacher=teacher, student=student,
         autoencoder=autoencoder, teacher_mean=teacher_mean,
         teacher_std=teacher_std, desc='Final map normalization')
-    # auc = test(
-    #     test_loader=test_loader, teacher=teacher, student=student,
-    #     autoencoder=autoencoder, teacher_mean=teacher_mean,
-    #     teacher_std=teacher_std, q_st_start=q_st_start, q_st_end=q_st_end,
-    #     q_ae_start=q_ae_start, q_ae_end=q_ae_end,
-    #     test_output_dir=test_output_dir, desc='Final inference')
-    # print('Final image auc: {:.4f}'.format(auc))
+    test_output_dir = 'output/anomaly_maps/bottle'
+    auc = test(
+        test_loader=test_loader, teacher=teacher, student=student,
+        autoencoder=autoencoder, teacher_mean=teacher_mean,
+        teacher_std=teacher_std, q_st_start=q_st_start, q_st_end=q_st_end,
+        q_ae_start=q_ae_start, q_ae_end=q_ae_end,
+        test_output_dir=test_output_dir, desc='Final inference')
+    print('Final image auc: {:.4f}'.format(auc))
 
+def transform_batch_tensor(image_batch):
+    # image_batch is expected to have shape [N, C, H, W]
+    transformed_images = []
+    for img in image_batch:
+        # Resize each image in the batch
+        resized_img = F.resize(img, [image_size, image_size])
+
+        # Normalize each image in the batch (if necessary)
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
+        normalized_img = F.normalize(resized_img, mean=mean, std=std)
+
+        transformed_images.append(normalized_img)
+
+    # Stack the list of tensors back into a batch
+    transformed_batch = torch.stack(transformed_images)
+    return transformed_batch
 
 def test(test_loader, teacher, student, autoencoder, teacher_mean, teacher_std,
          q_st_start, q_st_end, q_ae_start, q_ae_end, test_output_dir=None,
@@ -497,14 +393,12 @@ def test(test_loader, teacher, student, autoencoder, teacher_mean, teacher_std,
     y_true = []
     y_score = []
     for data in tqdm(test_loader, desc=desc):
-        fg, labels, image, features = data
+        fg, labels, image = data
+        _, C, H, W = image.shape
+        orig_width = W
+        orig_height = H
 
-        orig_width = image.width
-        orig_height = image.height
-        image = default_transform(image)
-        image = image[None]
-
-        fg, image, features = [t.to('cuda') for t in [fg, image, features]]
+        fg, image = [t.to('cuda') for t in [fg, image]]
 
         map_combined, map_st, map_ae = predict(
             image=image, teacher=teacher, student=student,
@@ -516,16 +410,17 @@ def test(test_loader, teacher, student, autoencoder, teacher_mean, teacher_std,
             map_combined, (orig_height, orig_width), mode='bilinear')
         map_combined = map_combined[0, 0].cpu().numpy()
 
-        # TODO: apply with imageFolder dataloader
-        defect_class = os.path.basename(os.path.dirname(path))
-        # if test_output_dir is not None:
-        #     img_nm = os.path.split(path)[1].split('.')[0]
-        #     if not os.path.exists(os.path.join(test_output_dir, defect_class)):
-        #         os.makedirs(os.path.join(test_output_dir, defect_class))
-        #     file = os.path.join(test_output_dir, defect_class, img_nm + '.tiff')
-        #     tifffile.imwrite(file, map_combined)
+        defect_classes = ["broken_large", "broken_small", "contamination", "good"]
+        defect_class = defect_classes[labels.item()]
+        if test_output_dir is not None:
+            # TODO: make this the name of original image
+            img_nm = random.randint(0,1000)
+            if not os.path.exists(os.path.join(test_output_dir, defect_class)):
+                os.makedirs(os.path.join(test_output_dir, defect_class))
+            file = os.path.join(test_output_dir, defect_class, str(img_nm) + '.tiff')
+            tifffile.imwrite(file, map_combined)
 
-        y_true_image = 0 if defect_class == 'good' else 1
+        y_true_image = 0 if defect_class == "good" else 1
         y_score_image = np.max(map_combined)
         y_true.append(y_true_image)
         y_score.append(y_score_image)
@@ -558,8 +453,8 @@ def map_normalization(validation_loader, teacher, student, autoencoder,
     maps_ae = []
     # ignore augmented ae image
     for data in tqdm(validation_loader, desc=desc):
-        fg, labels, image, features = data
-        fg, image, features = [t.to('cuda') for t in [fg, image, features]]
+        fg, labels, image = data
+        fg, image = [t.to('cuda') for t in [fg, image]]
 
         map_combined, map_st, map_ae = predict(
             image=image, teacher=teacher, student=student,
@@ -580,8 +475,8 @@ def teacher_normalization(teacher, train_loader):
 
     mean_outputs = []
     for i, data in enumerate(tqdm(train_loader, desc='Computing mean of features')):
-        fg, labels, image, features = data
-        fg, image, features = [t.to('cuda') for t in [fg, image, features]]
+        fg, labels, image = data
+        fg, image = [t.to('cuda') for t in [fg, image]]
 
         teacher_output, _ = teacher(image)
         mean_output = torch.mean(teacher_output, dim=[0, 2, 3])
@@ -591,8 +486,8 @@ def teacher_normalization(teacher, train_loader):
 
     mean_distances = []
     for i, data in enumerate(tqdm(train_loader, desc='Computing std of features')):
-        fg, labels, image, features = data
-        fg, image, features = [t.to('cuda') for t in [fg, image, features]]
+        fg, labels, image = data
+        fg, image = [t.to('cuda') for t in [fg, image]]
 
         teacher_output, _ = teacher(image)
         distance = (teacher_output - channel_mean) ** 2
