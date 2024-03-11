@@ -140,9 +140,8 @@ class DefectDataset(Dataset):
             img = 0
 
         label = self.labels[index]
-        feat = self.features[index] if self.get_features else 0
 
-        ret = [fg, label, img, feat]
+        ret = [fg, label, img]
         return ret
 
 def train(train_loader, test_loader):
@@ -153,18 +152,18 @@ def train(train_loader, test_loader):
     mean_nll_obs = Score_Observer('AUROC mean over maps')
     max_nll_obs = Score_Observer('AUROC  max over maps')
 
-    for epoch in range(1):
+    for epoch in range(3):
         teacher.train()
         print(F'\nTrain epoch {epoch}')
-        for sub_epoch in range(1):
+        for sub_epoch in range(24):
             train_loss = list()
             for i, data in enumerate(tqdm(train_loader, disable=False)):
                 # Clear gradients.
                 optimizer.zero_grad()
 
                 # Unpack data and move to device.
-                fg, labels, image, features = data
-                fg, labels, image, features = [t.to('cuda') for t in [fg, labels, image, features]]
+                fg, labels, image = data
+                fg, labels, image = [t.to('cuda') for t in [fg, labels, image]]
 
                 # Downsample foreground mask to match the model output size.
                 fg_down = downsampling(fg, (24, 24), bin=False)
@@ -195,8 +194,8 @@ def train(train_loader, test_loader):
         with torch.no_grad():
             for i, data in enumerate(tqdm(test_loader, disable=False)):
                 # Unpack and move data to device, similar to training phase.
-                fg, labels, image, features = data
-                fg, image, features = [t.to('cuda') for t in [fg, image, features]]
+                fg, labels, image = data
+                fg, image = [t.to('cuda') for t in [fg, image]]
 
                 fg_down = downsampling(fg, (24, 24), bin=False)
                 z, jac = teacher(image)
