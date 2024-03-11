@@ -75,7 +75,6 @@ class DefectDataset(Dataset):
         self.labels = list()
         self.masks = list()
         self.images = list()
-        self.depths = list()
         self.class_names = ['good']
         self.get_mask = get_mask
         self.get_features = get_features
@@ -104,10 +103,6 @@ class DefectDataset(Dataset):
                     continue
                 self.images.append(i_path)
                 self.labels.append(label)
-                if self.set == 'test' and self.get_mask:
-                    extension = '_mask' if sc != 'good' else ''
-                    mask_path = os.path.join(root, 'ground_truth', sc, p[:-4] + extension + p[-4:])
-                    self.masks.append(mask_path)
 
 
         self.img_mean = torch.FloatTensor([0.485, 0.456, 0.406])[:, None, None]
@@ -132,17 +127,7 @@ class DefectDataset(Dataset):
         x = x.reshape(channels, img_len, img_len)
         return x
 
-    def get_3D(self, index):
-        sample = np.load(self.depths[index])
-        depth = sample[:, :, 0]
-        fg = sample[:, :, -1]
-        mean_fg = np.sum(fg * depth) / np.sum(fg)
-        depth = fg * depth + (1 - fg) * mean_fg
-        depth = (depth - mean_fg) * 100
-        return depth, fg
-
     def __getitem__(self, index):
-        depth = torch.zeros([1, 192, 192])
         fg = torch.ones([1, 192, 192])
 
         if self.set == 'test' or not self.get_features:
@@ -155,16 +140,10 @@ class DefectDataset(Dataset):
         label = self.labels[index]
         feat = self.features[index] if self.get_features else 0
 
-        ret = [depth, fg, label, img, feat]
-
-        if self.set == 'test' and self.get_mask:
-            with open(self.masks[index], 'rb') as f:
-                mask = Image.open(f)
-                mask = self.transform(np.array(mask), 192, binary=True)[:1]
-                mask[mask > 0] = 1
-                ret.append(mask)
+        ret = [fg, label, img, feat]
         return ret
 
+#TODO revisit to see if it is still needed
 class FeatureExtractor(nn.Module):
     def __init__(self, layer_idx=35):
         super(FeatureExtractor, self).__init__()
@@ -281,10 +260,6 @@ class StudentTeacherModel(nn.Module):
             self.net = get_nf()
         else:
             self.net = Student(channels_hidden=channels_hidden, n_blocks=n_blocks)
-        # Positional encoding initialization if enabled.
-
-        # Unshuffle operation for processing depth information.
-        self.unshuffle = nn.PixelUnshuffle(8)
 
     def forward(self, x):
         # Feature extraction based on the mode and configuration.
@@ -380,8 +355,8 @@ def main():
                 optimizer.zero_grad()
 
                 # Unpack data and move to device.
-                depth, fg, labels, image, features = data
-                depth, fg, labels, image, features = [t.to('cuda') for t in [depth, fg, labels, image, features]]
+                fg, labels, image, features = data
+                fg, labels, image, features = [t.to('cuda') for t in [fg, labels, image, features]]
 
                 # Downsample foreground mask to match the model output size.
                 fg_down = downsampling(fg, (24, 24), bin=False)
@@ -411,8 +386,8 @@ def main():
     with torch.no_grad():
         for i, data in enumerate(tqdm(test_loader, disable=False)):
             # Unpack and move data to device, similar to training phase.
-            depth, fg, labels, image, features = data
-            depth, fg, image, features = [t.to('cuda') for t in [depth, fg, image, features]]
+            fg, labels, image, features = data
+            fg, image, features = [t.to('cuda') for t in [fg, image, features]]
 
             fg_down = downsampling(fg, (24, 24), bin=False)
             z, jac = teacher(image)
@@ -464,8 +439,8 @@ def main():
         train_loss = list()
         for i, data in enumerate(tqdm(train_loader, disable=False)):
             optimizer.zero_grad()
-            depth, fg, labels, image, features = data
-            depth, fg, image, features = [t.to('cuda') for t in [depth, fg, image, features]]
+            fg, labels, image, features = data
+            fg, image, features = [t.to('cuda') for t in [fg, image, features]]
 
             # TODO revisit calculation of student loss using fg_down
             fg_down = downsampling(fg, (24, 24), bin=False)
@@ -522,14 +497,14 @@ def test(test_loader, teacher, student, autoencoder, teacher_mean, teacher_std,
     y_true = []
     y_score = []
     for data in tqdm(test_loader, desc=desc):
-        depth, fg, labels, image, features = data
+        fg, labels, image, features = data
 
         orig_width = image.width
         orig_height = image.height
         image = default_transform(image)
         image = image[None]
 
-        depth, fg, image, features = [t.to('cuda') for t in [depth, fg, image, features]]
+        fg, image, features = [t.to('cuda') for t in [fg, image, features]]
 
         map_combined, map_st, map_ae = predict(
             image=image, teacher=teacher, student=student,
@@ -583,8 +558,8 @@ def map_normalization(validation_loader, teacher, student, autoencoder,
     maps_ae = []
     # ignore augmented ae image
     for data in tqdm(validation_loader, desc=desc):
-        depth, fg, labels, image, features = data
-        depth, fg, image, features = [t.to('cuda') for t in [depth, fg, image, features]]
+        fg, labels, image, features = data
+        fg, image, features = [t.to('cuda') for t in [fg, image, features]]
 
         map_combined, map_st, map_ae = predict(
             image=image, teacher=teacher, student=student,
@@ -605,8 +580,8 @@ def teacher_normalization(teacher, train_loader):
 
     mean_outputs = []
     for i, data in enumerate(tqdm(train_loader, desc='Computing mean of features')):
-        depth, fg, labels, image, features = data
-        depth, fg, image, features = [t.to('cuda') for t in [depth, fg, image, features]]
+        fg, labels, image, features = data
+        fg, image, features = [t.to('cuda') for t in [fg, image, features]]
 
         teacher_output, _ = teacher(image)
         mean_output = torch.mean(teacher_output, dim=[0, 2, 3])
@@ -616,8 +591,8 @@ def teacher_normalization(teacher, train_loader):
 
     mean_distances = []
     for i, data in enumerate(tqdm(train_loader, desc='Computing std of features')):
-        depth, fg, labels, image, features = data
-        depth, fg, image, features = [t.to('cuda') for t in [depth, fg, image, features]]
+        fg, labels, image, features = data
+        fg, image, features = [t.to('cuda') for t in [fg, image, features]]
 
         teacher_output, _ = teacher(image)
         distance = (teacher_output - channel_mean) ** 2
