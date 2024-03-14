@@ -111,22 +111,6 @@ class DefectDataset(Dataset):
     def __len__(self):
         return len(self.images)
 
-    def transform(self, x, img_len, binary=False):
-        x = x.copy()
-        x = torch.FloatTensor(x)
-        if len(x.shape) == 2:
-            x = x[None, None]
-            channels = 1
-        elif len(x.shape) == 3:
-            x = x.permute(2, 0, 1)[None]
-            channels = x.shape[1]
-        else:
-            raise Exception(f'invalid dimensions of x:{x.shape}')
-
-        x = downsampling(x, (img_len, img_len), bin=binary)
-        x = x.reshape(channels, img_len, img_len)
-        return x
-
     def __getitem__(self, index):
         fg = torch.ones([1, 192, 192])
 
@@ -137,9 +121,10 @@ class DefectDataset(Dataset):
         else:
             img = 0
 
+        image_name = os.path.splitext(os.path.basename(self.images[index]))[0]
         label = self.labels[index]
 
-        ret = [fg, label, img]
+        ret = [fg, label, img, image_name]
         return ret
 
 #TODO revisit to see if it is still needed
@@ -284,6 +269,8 @@ def downsampling(x, size, to_tensor=False, bin=True):
         down[down > 0] = 1
     return down
 
+# TODO: for final result, include image penalty from imagenet dataset with 167GB of data
+# TODO: use feature extractor for autoencoder
 def main():
     teacher = StudentTeacherModel(nf=True)
     teacher.net.load_state_dict(torch.load('./models/teacher_nf_bottle.pth'))
@@ -317,7 +304,7 @@ def main():
         train_loss = list()
         for i, data in enumerate(tqdm(train_loader, disable=False)):
             optimizer.zero_grad()
-            fg, labels, image = data
+            fg, labels, image, _ = data
             fg, image = [t.to('cuda') for t in [fg, image]]
 
             # TODO revisit calculation of student loss using fg_down
@@ -369,31 +356,13 @@ def main():
         test_output_dir=test_output_dir, desc='Final inference')
     print('Final image auc: {:.4f}'.format(auc))
 
-def transform_batch_tensor(image_batch):
-    # image_batch is expected to have shape [N, C, H, W]
-    transformed_images = []
-    for img in image_batch:
-        # Resize each image in the batch
-        resized_img = F.resize(img, [image_size, image_size])
-
-        # Normalize each image in the batch (if necessary)
-        mean = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
-        std = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
-        normalized_img = F.normalize(resized_img, mean=mean, std=std)
-
-        transformed_images.append(normalized_img)
-
-    # Stack the list of tensors back into a batch
-    transformed_batch = torch.stack(transformed_images)
-    return transformed_batch
-
 def test(test_loader, teacher, student, autoencoder, teacher_mean, teacher_std,
          q_st_start, q_st_end, q_ae_start, q_ae_end, test_output_dir=None,
          desc='Running inference'):
     y_true = []
     y_score = []
     for data in tqdm(test_loader, desc=desc):
-        fg, labels, image = data
+        fg, labels, image, image_name = data
         _, C, H, W = image.shape
         orig_width = W
         orig_height = H
@@ -410,15 +379,16 @@ def test(test_loader, teacher, student, autoencoder, teacher_mean, teacher_std,
             map_combined, (orig_height, orig_width), mode='bilinear')
         map_combined = map_combined[0, 0].cpu().numpy()
 
-        defect_classes = ["broken_large", "broken_small", "contamination", "good"]
+        defect_classes = ["good", "broken_large", "broken_small", "contamination"]
         defect_class = defect_classes[labels.item()]
         if test_output_dir is not None:
             # TODO: make this the name of original image
-            img_nm = random.randint(0,1000)
+            img_nm = image_name[0]
             if not os.path.exists(os.path.join(test_output_dir, defect_class)):
                 os.makedirs(os.path.join(test_output_dir, defect_class))
-            file = os.path.join(test_output_dir, defect_class, str(img_nm) + '.tiff')
-            tifffile.imwrite(file, map_combined)
+            file = os.path.join(test_output_dir, defect_class, img_nm + '.png')
+            image_to_save = Image.fromarray((map_combined * 255).astype(np.uint8))
+            image_to_save.save(file)
 
         y_true_image = 0 if defect_class == "good" else 1
         y_score_image = np.max(map_combined)
@@ -453,7 +423,7 @@ def map_normalization(validation_loader, teacher, student, autoencoder,
     maps_ae = []
     # ignore augmented ae image
     for data in tqdm(validation_loader, desc=desc):
-        fg, labels, image = data
+        fg, labels, image, _ = data
         fg, image = [t.to('cuda') for t in [fg, image]]
 
         map_combined, map_st, map_ae = predict(
@@ -475,7 +445,7 @@ def teacher_normalization(teacher, train_loader):
 
     mean_outputs = []
     for i, data in enumerate(tqdm(train_loader, desc='Computing mean of features')):
-        fg, labels, image = data
+        fg, labels, image, _ = data
         fg, image = [t.to('cuda') for t in [fg, image]]
 
         teacher_output, _ = teacher(image)
@@ -486,7 +456,7 @@ def teacher_normalization(teacher, train_loader):
 
     mean_distances = []
     for i, data in enumerate(tqdm(train_loader, desc='Computing std of features')):
-        fg, labels, image = data
+        fg, labels, image, _ = data
         fg, image = [t.to('cuda') for t in [fg, image]]
 
         teacher_output, _ = teacher(image)
