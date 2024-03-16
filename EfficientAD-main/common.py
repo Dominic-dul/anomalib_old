@@ -5,60 +5,25 @@ from torchvision.datasets import ImageFolder
 
 def get_autoencoder(out_channels=384):
     return nn.Sequential(
-        # encoder
-        nn.Conv2d(in_channels=3, out_channels=32, kernel_size=4, stride=2,
-                  padding=1),
+        # Adjusted encoder to prevent too small feature maps
+        nn.Conv2d(in_channels=304, out_channels=32, kernel_size=3, stride=2, padding=1),
         nn.ReLU(inplace=True),
-        nn.Conv2d(in_channels=32, out_channels=32, kernel_size=4, stride=2,
-                  padding=1),
+        nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, stride=2, padding=1),
         nn.ReLU(inplace=True),
-        nn.Conv2d(in_channels=32, out_channels=64, kernel_size=4, stride=2,
-                  padding=1),
+        nn.Conv2d(in_channels=64, out_channels=128, kernel_size=3, stride=1, padding=1),  # Reduced stride to maintain larger feature map size
         nn.ReLU(inplace=True),
-        nn.Conv2d(in_channels=64, out_channels=64, kernel_size=4, stride=2,
-                  padding=1),
+        nn.Conv2d(in_channels=128, out_channels=256, kernel_size=3, stride=1, padding=1),  # Maintain feature map size
         nn.ReLU(inplace=True),
-        nn.Conv2d(in_channels=64, out_channels=64, kernel_size=4, stride=2,
-                  padding=1),
+
+        # Carefully adjusted decoder
+        nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),  # Explicitly control upsampling
+        nn.Conv2d(in_channels=256, out_channels=128, kernel_size=3, stride=1, padding=1),
         nn.ReLU(inplace=True),
-        nn.Conv2d(in_channels=64, out_channels=64, kernel_size=8),
-        # decoder
-        nn.Upsample(size=3, mode='bilinear'),
-        nn.Conv2d(in_channels=64, out_channels=64, kernel_size=4, stride=1,
-                  padding=2),
+        nn.Conv2d(in_channels=128, out_channels=64, kernel_size=3, stride=1, padding=1),
         nn.ReLU(inplace=True),
-        nn.Dropout(0.2),
-        nn.Upsample(size=8, mode='bilinear'),
-        nn.Conv2d(in_channels=64, out_channels=64, kernel_size=4, stride=1,
-                  padding=2),
-        nn.ReLU(inplace=True),
-        nn.Dropout(0.2),
-        nn.Upsample(size=15, mode='bilinear'),
-        nn.Conv2d(in_channels=64, out_channels=64, kernel_size=4, stride=1,
-                  padding=2),
-        nn.ReLU(inplace=True),
-        nn.Dropout(0.2),
-        nn.Upsample(size=32, mode='bilinear'),
-        nn.Conv2d(in_channels=64, out_channels=64, kernel_size=4, stride=1,
-                  padding=2),
-        nn.ReLU(inplace=True),
-        nn.Dropout(0.2),
-        nn.Upsample(size=63, mode='bilinear'),
-        nn.Conv2d(in_channels=64, out_channels=64, kernel_size=4, stride=1,
-                  padding=2),
-        nn.ReLU(inplace=True),
-        nn.Dropout(0.2),
-        nn.Upsample(size=127, mode='bilinear'),
-        nn.Conv2d(in_channels=64, out_channels=64, kernel_size=4, stride=1,
-                  padding=2),
-        nn.ReLU(inplace=True),
-        nn.Dropout(0.2),
-        nn.Upsample(size=24, mode='bilinear'),
-        nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1,
-                  padding=1),
-        nn.ReLU(inplace=True),
-        nn.Conv2d(in_channels=64, out_channels=out_channels, kernel_size=3,
-                  stride=1, padding=1)
+        nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),  # Another controlled upsampling step
+        nn.Conv2d(in_channels=64, out_channels=out_channels, kernel_size=3, stride=1, padding=1),  # Final convolution to adjust channels
+        nn.ReLU(inplace=True)
     )
 
 def get_pdn_small(out_channels=384, padding=False):

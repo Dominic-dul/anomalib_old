@@ -240,11 +240,14 @@ class Student(nn.Module):
         return [0] # Placeholder for Jacobian computation, not applicable for student model.
 
 class StudentTeacherModel(nn.Module):
-    def __init__(self, nf=False, n_blocks=4, channels_hidden=64):
+    def __init__(self, nf=False, n_blocks=4, channels_hidden=64, model_autoencoder=False):
         super(StudentTeacherModel, self).__init__()
 
         self.feature_extractor = FeatureExtractor()
-        if nf:
+        self.model_autoencoder = model_autoencoder
+        if model_autoencoder:
+            self.net = get_autoencoder(304)
+        elif nf:
             self.net = get_nf()
         else:
             self.net = Student(channels_hidden=channels_hidden, n_blocks=n_blocks)
@@ -260,10 +263,13 @@ class StudentTeacherModel(nn.Module):
         # Processing through the network with positional encoding.
         z = self.net(inp)
 
-        # Calculating the Jacobian for the normalizing flow.
-        jac = self.net.jacobian(run_forward=False)[0]
-        # Returning the transformed input and Jacobian.
-        return z, jac
+        if self.model_autoencoder:
+            return z
+        else:
+            # Calculating the Jacobian for the normalizing flow.
+            jac = self.net.jacobian(run_forward=False)[0]
+            # Returning the transformed input and Jacobian.
+            return z, jac
 
 def downsampling(x, size, to_tensor=False, bin=True):
     if to_tensor:
@@ -278,6 +284,12 @@ def downsampling(x, size, to_tensor=False, bin=True):
 # TODO: use training augmentations
 # TODO: check if feature extractor is actually needed for student network
 def main():
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    torch.cuda.manual_seed_all(42)  # if you are using multi-GPU.
+    np.random.seed(42)
+    random.seed(42)
+
     teacher = StudentTeacherModel(nf=True)
     teacher.net.load_state_dict(torch.load('./models/teacher_nf_bottle.pth'))
     teacher.eval()
@@ -295,7 +307,7 @@ def main():
     student.train()
     student.cuda()
 
-    autoencoder = get_autoencoder(304)
+    autoencoder = StudentTeacherModel(model_autoencoder=True)
     autoencoder.train()
     autoencoder.cuda()
 
@@ -332,6 +344,10 @@ def main():
             ae_output = autoencoder(image)
             with torch.no_grad():
                 teacher_output_ae, _ = teacher(image)
+                # print(f"teacher_output_ae shape: {teacher_output_ae.shape}")
+                # print(f"ae_output shape: {ae_output.shape}")
+                # print(f"teacher_output_ae: {teacher_output_ae}")
+                # print(f"ae_output: {ae_output}")
                 teacher_output_ae = (teacher_output_ae - teacher_mean) / teacher_std
             student_output_ae, _ = student(image)
             student_output_ae = student_output_ae[:, 304:]
@@ -361,30 +377,6 @@ def main():
         q_ae_start=q_ae_start, q_ae_end=q_ae_end,
         test_output_dir=test_output_dir, desc='Final inference')
     print('Final image auc: {:.4f}'.format(auc))
-def display_image(images, defect_class, image_name):
-    # Define the root directory for results
-    root_dir = "test_images"
-    # Construct the full path for the class-specific directory
-    class_dir = os.path.join(root_dir, defect_class)
-
-    # Check if the root directory exists, if not, create it
-    if not os.path.exists(root_dir):
-        os.makedirs(root_dir)
-
-    # Check if the class-specific directory exists, if not, create it
-    if not os.path.exists(class_dir):
-        os.makedirs(class_dir)
-
-    # Define the full path for the image to be saved
-    image_path = os.path.join(class_dir, f"{image_name}.png")
-
-    # Since the image tensor is expected to be [1, 3, H, W], remove the batch dimension
-    image_tensor = images.squeeze(0)
-
-    # Save the image
-    save_image(image_tensor, image_path)
-
-    print(f"Image saved to {image_path}")
 
 def test(test_loader, teacher, student, autoencoder, teacher_mean, teacher_std,
          q_st_start, q_st_end, q_ae_start, q_ae_end, test_output_dir=None,
@@ -398,7 +390,6 @@ def test(test_loader, teacher, student, autoencoder, teacher_mean, teacher_std,
         orig_height = H
 
         defect_classes = ["good", "broken_large", "broken_small", "contamination"]
-        display_image(image, defect_classes[labels.item()], image_name[0])
 
         fg, image = [t.to('cuda') for t in [fg, image]]
 
