@@ -21,6 +21,10 @@ from PIL import Image
 from os.path import join
 from scipy.ndimage.morphology import binary_dilation
 from torchvision.datasets import ImageFolder
+import matplotlib.pyplot as plt
+from torchvision.transforms.functional import to_pil_image
+from IPython.display import display
+from torchvision.utils import save_image
 
 def get_argparse():
     parser = argparse.ArgumentParser()
@@ -271,6 +275,8 @@ def downsampling(x, size, to_tensor=False, bin=True):
 
 # TODO: for final result, include image penalty from imagenet dataset with 167GB of data
 # TODO: use feature extractor for autoencoder
+# TODO: use training augmentations
+# TODO: check if feature extractor is actually needed for student network
 def main():
     teacher = StudentTeacherModel(nf=True)
     teacher.net.load_state_dict(torch.load('./models/teacher_nf_bottle.pth'))
@@ -355,6 +361,30 @@ def main():
         q_ae_start=q_ae_start, q_ae_end=q_ae_end,
         test_output_dir=test_output_dir, desc='Final inference')
     print('Final image auc: {:.4f}'.format(auc))
+def display_image(images, defect_class, image_name):
+    # Define the root directory for results
+    root_dir = "test_images"
+    # Construct the full path for the class-specific directory
+    class_dir = os.path.join(root_dir, defect_class)
+
+    # Check if the root directory exists, if not, create it
+    if not os.path.exists(root_dir):
+        os.makedirs(root_dir)
+
+    # Check if the class-specific directory exists, if not, create it
+    if not os.path.exists(class_dir):
+        os.makedirs(class_dir)
+
+    # Define the full path for the image to be saved
+    image_path = os.path.join(class_dir, f"{image_name}.png")
+
+    # Since the image tensor is expected to be [1, 3, H, W], remove the batch dimension
+    image_tensor = images.squeeze(0)
+
+    # Save the image
+    save_image(image_tensor, image_path)
+
+    print(f"Image saved to {image_path}")
 
 def test(test_loader, teacher, student, autoencoder, teacher_mean, teacher_std,
          q_st_start, q_st_end, q_ae_start, q_ae_end, test_output_dir=None,
@@ -366,6 +396,9 @@ def test(test_loader, teacher, student, autoencoder, teacher_mean, teacher_std,
         _, C, H, W = image.shape
         orig_width = W
         orig_height = H
+
+        defect_classes = ["good", "broken_large", "broken_small", "contamination"]
+        display_image(image, defect_classes[labels.item()], image_name[0])
 
         fg, image = [t.to('cuda') for t in [fg, image]]
 
@@ -379,7 +412,6 @@ def test(test_loader, teacher, student, autoencoder, teacher_mean, teacher_std,
             map_combined, (orig_height, orig_width), mode='bilinear')
         map_combined = map_combined[0, 0].cpu().numpy()
 
-        defect_classes = ["good", "broken_large", "broken_small", "contamination"]
         defect_class = defect_classes[labels.item()]
         if test_output_dir is not None:
             # TODO: make this the name of original image
@@ -387,6 +419,7 @@ def test(test_loader, teacher, student, autoencoder, teacher_mean, teacher_std,
             if not os.path.exists(os.path.join(test_output_dir, defect_class)):
                 os.makedirs(os.path.join(test_output_dir, defect_class))
             file = os.path.join(test_output_dir, defect_class, img_nm + '.png')
+            # TODO consider using .tiff as it is more detailed for pixels
             image_to_save = Image.fromarray((map_combined * 255).astype(np.uint8))
             image_to_save.save(file)
 
