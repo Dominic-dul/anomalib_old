@@ -294,7 +294,6 @@ def main():
     teacher.net.load_state_dict(torch.load('./models/teacher_nf_bottle.pth'))
     teacher.eval()
     teacher.cuda()
-    #TODO split train dataset into training and validation
     full_train_set = DefectDataset(set='train', get_mask=False, get_features=False)
     train_size = int(0.9 * len(full_train_set))
     validation_size = len(full_train_set) - train_size
@@ -318,7 +317,7 @@ def main():
                                                  autoencoder.parameters()), lr=2e-4, eps=1e-08, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=int(0.95 * train_steps), gamma=0.1)
 
-    # Currently the best achieved loss for existing saved student and autoencoder models is 21.2726
+    # Currently the best achieved loss for existing saved student and autoencoder models is 21.2708
     temp_loss = 150
     temp_loss_general = 200
     for sub_epoch in range(train_steps):
@@ -373,9 +372,21 @@ def main():
             temp_loss_general = temp_loss
             print("Current best loss: {:.4f}  ".format(temp_loss_general))
             torch.save(student.net.state_dict(), join('./models', 'student_bottle.pth'))
-            torch.save(autoencoder, join('./models', 'autoencoder_bottle.pth'))
+            torch.save(autoencoder.net.state_dict(), join('./models', 'autoencoder_bottle.pth'))
 
     teacher.eval()
+
+    # TODO load only the student, but keep the autoencoder from training loop
+    # student = StudentTeacherModel(nf=False, channels_hidden=608, n_blocks=4)
+    # student.net.load_state_dict(torch.load('./models/student_bottle.pth'))
+    # student.eval()
+    # student.cuda()
+    #
+    # autoencoder = StudentTeacherModel(model_autoencoder=True)
+    # autoencoder.net.load_state_dict(torch.load('./models/autoencoder_bottle.pth'))
+    # autoencoder.eval()
+    # autoencoder.cuda()
+
     student.eval()
     autoencoder.eval()
 
@@ -390,6 +401,7 @@ def main():
         teacher_std=teacher_std, q_st_start=q_st_start, q_st_end=q_st_end,
         q_ae_start=q_ae_start, q_ae_end=q_ae_end,
         test_output_dir=test_output_dir, desc='Final inference')
+    # Best image auc: 96.9048
     print('Final image auc: {:.4f}'.format(auc))
 
 def test(test_loader, teacher, student, autoencoder, teacher_mean, teacher_std,
