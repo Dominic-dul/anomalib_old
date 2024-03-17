@@ -280,9 +280,9 @@ def downsampling(x, size, to_tensor=False, bin=True):
     return down
 
 # TODO: for final result, include image penalty from imagenet dataset with 167GB of data
-# TODO: use feature extractor for autoencoder
-# TODO: use training augmentations
-# TODO: check if feature extractor is actually needed for student network
+# TODO: use training augmentations (does it make sense if training is done with unsupervised way - learning representations of normal images)
+# TODO: check if feature extractor is actually needed for student and autoencoder networks
+# TODO: train teacher on imagenet rather than on efficientnet
 def main():
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
@@ -313,14 +313,18 @@ def main():
 
     teacher_mean, teacher_std = teacher_normalization(teacher, train_loader)
 
-    train_steps = 2
+    train_steps = 10
     optimizer = torch.optim.Adam(itertools.chain(student.net.parameters(),
                                                  autoencoder.parameters()), lr=2e-4, eps=1e-08, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=int(0.95 * train_steps), gamma=0.1)
 
+    # Currently the best achieved loss for existing saved student and autoencoder models is 21.2726
+    temp_loss = 150
+    temp_loss_general = 200
     for sub_epoch in range(train_steps):
         train_loss = list()
-        for i, data in enumerate(tqdm(train_loader, disable=False)):
+        print('Epoch {} out of {}'.format(sub_epoch+1, train_steps))
+        for i, data in enumerate(tqdm(train_loader, disable=True)):
             optimizer.zero_grad()
             fg, labels, image, _ = data
             fg, image = [t.to('cuda') for t in [fg, image]]
@@ -362,9 +366,19 @@ def main():
             optimizer.step()
             scheduler.step()
 
-            print("Current loss: {:.4f}  ".format(loss_total.item()))
+            if (loss_total.item() < temp_loss):
+                temp_loss = loss_total.item()
 
-    # TODO replace with validation loader
+        if (temp_loss < temp_loss_general):
+            temp_loss_general = temp_loss
+            print("Current best loss: {:.4f}  ".format(temp_loss_general))
+            torch.save(student.net.state_dict(), join('./models', 'student_bottle.pth'))
+            torch.save(autoencoder, join('./models', 'autoencoder_bottle.pth'))
+
+    teacher.eval()
+    student.eval()
+    autoencoder.eval()
+
     q_st_start, q_st_end, q_ae_start, q_ae_end = map_normalization(
         validation_loader=validation_loader, teacher=teacher, student=student,
         autoencoder=autoencoder, teacher_mean=teacher_mean,
@@ -407,12 +421,19 @@ def test(test_loader, teacher, student, autoencoder, teacher_mean, teacher_std,
         if test_output_dir is not None:
             # TODO: make this the name of original image
             img_nm = image_name[0]
+            # Saving images as png:
             if not os.path.exists(os.path.join(test_output_dir, defect_class)):
                 os.makedirs(os.path.join(test_output_dir, defect_class))
             file = os.path.join(test_output_dir, defect_class, img_nm + '.png')
-            # TODO consider using .tiff as it is more detailed for pixels
             image_to_save = Image.fromarray((map_combined * 255).astype(np.uint8))
             image_to_save.save(file)
+
+            test_output_dir_tiff = 'output/anomaly_maps/bottle_tiff'
+            # Saving images as tiff
+            if not os.path.exists(os.path.join(test_output_dir_tiff, defect_class)):
+                os.makedirs(os.path.join(test_output_dir_tiff, defect_class))
+            file_tiff = os.path.join(test_output_dir_tiff, defect_class, img_nm + '.tiff')
+            tifffile.imwrite(file_tiff, map_combined)
 
         y_true_image = 0 if defect_class == "good" else 1
         y_score_image = np.max(map_combined)
