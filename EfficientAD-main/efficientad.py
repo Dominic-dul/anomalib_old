@@ -25,6 +25,8 @@ import matplotlib.pyplot as plt
 from torchvision.transforms.functional import to_pil_image
 from IPython.display import display
 from torchvision.utils import save_image
+from train_nf_teacher import *
+from torchvision.transforms import ToPILImage
 
 def get_argparse():
     parser = argparse.ArgumentParser()
@@ -73,7 +75,7 @@ def train_transform(image):
     return default_transform(image), default_transform(transform_ae(image))
 
 class DefectDataset(Dataset):
-    def __init__(self, set='train', get_mask=True, get_features=True):
+    def __init__(self, set='train', get_mask=False):
         super(DefectDataset, self).__init__()
         self.set = set
         self.labels = list()
@@ -81,7 +83,6 @@ class DefectDataset(Dataset):
         self.images = list()
         self.class_names = ['good']
         self.get_mask = get_mask
-        self.get_features = get_features
         self.image_transforms = transforms.Compose([transforms.Resize((768, 768)), transforms.ToTensor(),
                                                     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
         root = join('./mvtec_anomaly_detection/', 'bottle')
@@ -108,6 +109,10 @@ class DefectDataset(Dataset):
                 self.images.append(i_path)
                 self.labels.append(label)
 
+            if self.get_mask and self.set != 'train' and sc != 'good':
+                mask_dir = os.path.join(root, 'ground_truth', sc)
+                self.masks.extend(
+                    [os.path.join(mask_dir, p) for p in sorted(os.listdir(mask_dir))])
 
         self.img_mean = torch.FloatTensor([0.485, 0.456, 0.406])[:, None, None]
         self.img_std = torch.FloatTensor([0.229, 0.224, 0.225])[:, None, None]
@@ -118,20 +123,32 @@ class DefectDataset(Dataset):
     def __getitem__(self, index):
         fg = torch.ones([1, 192, 192])
 
-        if self.set == 'test' or not self.get_features:
-            with open(self.images[index], 'rb') as f:
-                img = Image.open(f).convert('RGB')
-            img = self.image_transforms(img)
-        else:
-            img = 0
+        with open(self.images[index], 'rb') as f:
+            img = Image.open(f).convert('RGB')
+        img = self.image_transforms(img)
 
         image_name = os.path.splitext(os.path.basename(self.images[index]))[0]
         label = self.labels[index]
 
         ret = [fg, label, img, image_name]
+
+        if self.get_mask and self.set != 'train':
+            if label == 0:
+                mask = torch.zeros(1, 768, 768)
+            else:
+                with open(self.masks[index], 'rb') as f:
+                    mask = Image.open(f).convert('L')
+
+                mask_transforms = transforms.Compose([
+                    transforms.Resize((768, 768)),
+                    transforms.ToTensor()
+                ])
+
+                mask = mask_transforms(mask)
+                mask = (mask > 0.5).float()
+            ret.append(mask)
         return ret
 
-#TODO revisit to see if it is still needed
 class FeatureExtractor(nn.Module):
     def __init__(self, layer_idx=35):
         super(FeatureExtractor, self).__init__()
@@ -254,7 +271,6 @@ class StudentTeacherModel(nn.Module):
 
     def forward(self, x):
         # Feature extraction based on the mode and configuration.
-        # TODO figure out why feature extractor is used and not the image itself
         with torch.no_grad():
             f = self.feature_extractor(x)
 
@@ -280,9 +296,7 @@ def downsampling(x, size, to_tensor=False, bin=True):
     return down
 
 # TODO: for final result, include image penalty from imagenet dataset with 167GB of data
-# TODO: use training augmentations (does it make sense if training is done with unsupervised way - learning representations of normal images)
-# TODO: check if feature extractor is actually needed for student and autoencoder networks
-# TODO: train teacher on imagenet rather than on efficientnet
+# TODO: adjust teacher training epochs as per paper
 def main():
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
@@ -292,16 +306,17 @@ def main():
 
     teacher = StudentTeacherModel(nf=True)
     teacher.net.load_state_dict(torch.load('./models/teacher_nf_bottle.pth'))
+    # teacher = main_teacher()
     teacher.eval()
     teacher.cuda()
-    full_train_set = DefectDataset(set='train', get_mask=False, get_features=False)
+    full_train_set = DefectDataset(set='train', get_mask=False)
     train_size = int(0.9 * len(full_train_set))
     validation_size = len(full_train_set) - train_size
     rng = torch.Generator().manual_seed(seed)
     train_set, validation_set = torch.utils.data.random_split(full_train_set, [train_size, validation_size], rng)
     train_loader = DataLoader(train_set, pin_memory=True, batch_size=8, shuffle=True, drop_last=True)
     validation_loader = DataLoader(validation_set, pin_memory=True, batch_size=8)
-    test_loader = DataLoader(DefectDataset(set='test', get_mask=False, get_features=False), pin_memory=True, batch_size=1, shuffle=False, drop_last=False)
+    test_loader = DataLoader(DefectDataset(set='test', get_mask=True), pin_memory=True, batch_size=1, shuffle=False, drop_last=False)
     student = StudentTeacherModel(nf=False, channels_hidden=608, n_blocks=4)
     student.train()
     student.cuda()
@@ -314,10 +329,10 @@ def main():
 
     train_steps = 10
     optimizer = torch.optim.Adam(itertools.chain(student.net.parameters(),
-                                                 autoencoder.parameters()), lr=2e-4, eps=1e-08, weight_decay=1e-5)
+                                                 autoencoder.net.parameters()), lr=2e-4, eps=1e-08, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=int(0.95 * train_steps), gamma=0.1)
 
-    # Currently the best achieved loss for existing saved student and autoencoder models is 21.2708
+    # Currently the best achieved loss for existing saved student and autoencoder models is 21.2708 after 10 epochs
     temp_loss = 150
     temp_loss_general = 200
     for sub_epoch in range(train_steps):
@@ -376,7 +391,6 @@ def main():
 
     teacher.eval()
 
-    # TODO load only the student, but keep the autoencoder from training loop
     # student = StudentTeacherModel(nf=False, channels_hidden=608, n_blocks=4)
     # student.net.load_state_dict(torch.load('./models/student_bottle.pth'))
     # student.eval()
@@ -409,15 +423,18 @@ def test(test_loader, teacher, student, autoencoder, teacher_mean, teacher_std,
          desc='Running inference'):
     y_true = []
     y_score = []
+    mask_flat_combined = []
+    map_flat_combined = []
+
     for data in tqdm(test_loader, desc=desc):
-        fg, labels, image, image_name = data
+        fg, labels, image, image_name, mask = data
         _, C, H, W = image.shape
         orig_width = W
         orig_height = H
 
         defect_classes = ["good", "broken_large", "broken_small", "contamination"]
 
-        fg, image = [t.to('cuda') for t in [fg, image]]
+        fg, image, mask = [t.to('cuda') for t in [fg, image, mask]]
 
         map_combined, map_st, map_ae = predict(
             image=image, teacher=teacher, student=student,
@@ -428,6 +445,11 @@ def test(test_loader, teacher, student, autoencoder, teacher_mean, teacher_std,
         map_combined = torch.nn.functional.interpolate(
             map_combined, (orig_height, orig_width), mode='bilinear')
         map_combined = map_combined[0, 0].cpu().numpy()
+
+        # map_min = map_combined.min()
+        # map_max = map_combined.max()
+        # map_normalized = (map_combined - map_min) / (map_max - map_min)
+        # map_inverted = 1.0 - map_normalized
 
         defect_class = defect_classes[labels.item()]
         if test_output_dir is not None:
@@ -447,10 +469,38 @@ def test(test_loader, teacher, student, autoencoder, teacher_mean, teacher_std,
             file_tiff = os.path.join(test_output_dir_tiff, defect_class, img_nm + '.tiff')
             tifffile.imwrite(file_tiff, map_combined)
 
+            # Saving masks for checking if correct ones are saved
+            # test_output_dir_mask = 'output/anomaly_maps/masks'
+            # if not os.path.exists(os.path.join(test_output_dir_mask, defect_class)):
+            #     os.makedirs(os.path.join(test_output_dir_mask, defect_class))
+            # mask_file = os.path.join(test_output_dir_mask, defect_class, img_nm + '_mask.png')
+            #
+            # mask_temp = mask.squeeze().cpu().numpy()
+            # image_to_save = Image.fromarray((mask_temp * 255).astype(np.uint8))
+            # image_to_save.save(mask_file)
+
+        map_combined = 1 / (1 + np.exp(-map_combined))
+
         y_true_image = 0 if defect_class == "good" else 1
         y_score_image = np.max(map_combined)
         y_true.append(y_true_image)
         y_score.append(y_score_image)
+
+        mask_flat = mask.flatten().cpu().numpy()
+        map_flat = map_combined.flatten()
+        # print(f"\nDefect class: {defect_class}")
+        # print(f'Map flat size: {map_flat.size}')
+        # print(f'Mask flat size: {map_flat.size}')
+        # print(f"\nMap combined contains {np.sum(map_flat >= 0.5)} elements that are higher or equal to 0.5")
+        # print(f"\nMap combined contains {np.sum(map_flat < 0.5)} elements that are lower than 0.5")
+        # print(f"\nMask contains {np.sum(mask_flat >= 0.5)} elements that are higher or equal to 0.5")
+        # print(f"\nMask contains {np.sum(mask_flat < 0.5)} elements that are lower than 0.5")
+        mask_flat_combined.extend(mask_flat)
+        map_flat_combined.extend(map_flat)
+
+    pixel_roc_auc = roc_auc_score(y_true=mask_flat_combined, y_score=map_flat_combined)
+    print(f'\nROC-AUC pixel score: {pixel_roc_auc * 100}')
+
     auc = roc_auc_score(y_true=y_true, y_score=y_score)
     return auc * 100
 

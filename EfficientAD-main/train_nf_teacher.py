@@ -71,7 +71,7 @@ def get_nf_loss(z, jac, mask=None, per_sample=False, per_pixel=False):
     return loss_per_sample.mean()
 
 class DefectDataset(Dataset):
-    def __init__(self, set='train', get_mask=True, get_features=True):
+    def __init__(self, set='train', get_mask=True):
         super(DefectDataset, self).__init__()
         self.set = set
         self.labels = list()
@@ -79,7 +79,6 @@ class DefectDataset(Dataset):
         self.images = list()
         self.class_names = ['good']
         self.get_mask = get_mask
-        self.get_features = get_features
         self.image_transforms = transforms.Compose([transforms.Resize((768, 768)), transforms.ToTensor(),
                                                     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
         root = join('./mvtec_anomaly_detection/', 'bottle')
@@ -132,12 +131,9 @@ class DefectDataset(Dataset):
     def __getitem__(self, index):
         fg = torch.ones([1, 192, 192])
 
-        if self.set == 'test' or not self.get_features:
-            with open(self.images[index], 'rb') as f:
-                img = Image.open(f).convert('RGB')
-            img = self.image_transforms(img)
-        else:
-            img = 0
+        with open(self.images[index], 'rb') as f:
+            img = Image.open(f).convert('RGB')
+        img = self.image_transforms(img)
 
         label = self.labels[index]
 
@@ -152,10 +148,10 @@ def train(train_loader, test_loader):
     mean_nll_obs = Score_Observer('AUROC mean over maps')
     max_nll_obs = Score_Observer('AUROC  max over maps')
 
-    for epoch in range(3):
+    for epoch in range(2):
         teacher.train()
         print(F'\nTrain epoch {epoch}')
-        for sub_epoch in range(24):
+        for sub_epoch in range(2):
             train_loss = list()
             for i, data in enumerate(tqdm(train_loader, disable=False)):
                 # Clear gradients.
@@ -233,9 +229,9 @@ def train(train_loader, test_loader):
     print('teacher saved!')
     teacher.to('cuda')
 
-    return mean_nll_obs, max_nll_obs
+    return teacher, mean_nll_obs, max_nll_obs
 
-def main():
+def main_teacher():
     # all_classes = [d for d in os.listdir('./mvtec_anomaly_detection/') if os.path.isdir(join('./mvtec_anomaly_detection/', d))]
     # print(all_classes)
     max_scores = list()
@@ -244,11 +240,11 @@ def main():
     # for i_c, cn in enumerate(all_classes):
     # c.class_name = cn
     print('\n\nTrain class ' + 'bottle')
-    train_loader = DataLoader(DefectDataset(set='train', get_mask=False, get_features=False), pin_memory=True,
+    train_loader = DataLoader(DefectDataset(set='train', get_mask=False), pin_memory=True,
                               batch_size=8, shuffle=True, drop_last=True)
-    test_loader = DataLoader(DefectDataset(set='test', get_mask=False, get_features=False), pin_memory=True,
+    test_loader = DataLoader(DefectDataset(set='test', get_mask=False), pin_memory=True,
                              batch_size=16, shuffle=False, drop_last=False)
-    mean_sc, max_sc = train(train_loader, test_loader)
+    mean_sc, max_sc, teacher = train(train_loader, test_loader)
     mean_scores.append(mean_sc)
     max_scores.append(max_sc)
 
@@ -258,6 +254,8 @@ def main():
     best_max = np.mean([s.best_score for s in max_scores])
     print('\nAUROC % after last epoch\n\tmean over maps: {:.2f} \t max over maps: {:.2f}'.format(last_mean, last_max))
     print('best AUROC %\n\tmean over maps: {:.2f} \t max over maps: {:.2f}'.format(best_mean, best_max))
+
+    return teacher
 
 if __name__ == '__main__':
     main()
