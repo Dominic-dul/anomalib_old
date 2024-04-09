@@ -10,8 +10,6 @@ import itertools
 import os
 import random
 from tqdm import tqdm
-from common import get_autoencoder, get_pdn_small, get_pdn_medium, \
-    ImageFolderWithoutTarget, ImageFolderWithPath, InfiniteDataloader
 from sklearn.metrics import roc_auc_score
 from efficientnet_pytorch import EfficientNet
 import torch.nn.functional as F
@@ -19,14 +17,7 @@ from freia_funcs import *
 import torch.nn as nn
 from PIL import Image
 from os.path import join
-from scipy.ndimage.morphology import binary_dilation
-from torchvision.datasets import ImageFolder
-import matplotlib.pyplot as plt
-from torchvision.transforms.functional import to_pil_image
-from IPython.display import display
-from torchvision.utils import save_image
-# from train_nf_teacher import *
-from torchvision.transforms import ToPILImage
+# from train_nf_teacher import main_teacher
 
 def get_argparse():
     parser = argparse.ArgumentParser()
@@ -210,7 +201,7 @@ class Student(nn.Module):
     def __init__(self, channels_hidden=1024, n_blocks=4):
         super(Student, self).__init__()
         # Calculate input features, adjust for positional encoding if used
-        inp_feat = 304
+        inp_feat = 336
         # Initial convolution layer to adapt the input feature size
         self.conv1 = nn.Conv2d(inp_feat, channels_hidden, kernel_size=3, padding=1)
         # Final convolution layer to produce the output feature map
@@ -227,6 +218,8 @@ class Student(nn.Module):
         self.act = nn.LeakyReLU()
 
     def forward(self, x):
+        # Concatenate positional encoding to the input
+        x = torch.cat(x, dim=1)
         # Process input through the initial convolution layer
         x = self.act(self.conv1(x))
         # Pass the output through each residual block
@@ -265,6 +258,30 @@ def positionalencoding2d(D, H, W):
     # Returns the positional encoding.
     return P.to('cuda')[None]
 
+def get_autoencoder(out_channels=304):
+    return nn.Sequential(
+        # Adjusted encoder to prevent too small feature maps
+        nn.Conv2d(in_channels=336, out_channels=32, kernel_size=3, stride=2, padding=1),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, stride=2, padding=1),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(in_channels=64, out_channels=128, kernel_size=3, stride=1, padding=1),  # Reduced stride to maintain larger feature map size
+        nn.ReLU(inplace=True),
+        nn.Conv2d(in_channels=128, out_channels=256, kernel_size=3, stride=1, padding=1),  # Maintain feature map size
+        nn.ReLU(inplace=True),
+
+        # Carefully adjusted decoder
+        nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),  # Explicitly control upsampling
+        nn.Conv2d(in_channels=256, out_channels=128, kernel_size=3, stride=1, padding=1),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(in_channels=128, out_channels=64, kernel_size=3, stride=1, padding=1),
+        nn.ReLU(inplace=True),
+        nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),  # Another controlled upsampling step
+        nn.Conv2d(in_channels=64, out_channels=out_channels, kernel_size=3, stride=1, padding=1),  # Final convolution to adjust channels
+        nn.ReLU(inplace=True)
+    )
+
+
 class StudentTeacherModel(nn.Module):
     def __init__(self, nf=False, n_blocks=4, channels_hidden=64, model_autoencoder=False):
         super(StudentTeacherModel, self).__init__()
@@ -286,12 +303,14 @@ class StudentTeacherModel(nn.Module):
             f = self.feature_extractor(x)
 
         inp = f
+        # Processing through the network with positional encoding.
+        cond = self.pos_enc.tile(inp.shape[0], 1, 1, 1)
 
         if self.model_autoencoder:
-            return self.net(inp)
+            ae_input = torch.cat([cond, inp], dim=1)
+            return self.net(ae_input)
         else:
-            # Processing through the network with positional encoding.
-            cond = self.pos_enc.tile(inp.shape[0], 1, 1, 1)
+            # Passing input through the network
             z = self.net([cond, inp])
             # Calculating the Jacobian for the normalizing flow.
             jac = self.net.jacobian(run_forward=False)[0]
@@ -309,10 +328,13 @@ def downsampling(x, size, to_tensor=False, bin=True):
 # TODO: for final result, include image penalty from imagenet dataset with 167GB of data
 # TODO: adjust teacher training epochs as per paper
 # TODO: try turnning off gamma
+# TODO: try to improve autoencoder and see if score is better if it is removed
+# TODO: revisit teacher normalization process to see whether it is calculated correctly
+# TODO: Check whether score calculation is correct (0 true is 0 score and same with 1)
 def main():
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
-    torch.cuda.manual_seed_all(42)  # if you are using multi-GPU.
+    torch.cuda.manual_seed_all(42)
     np.random.seed(42)
     random.seed(42)
 
@@ -321,6 +343,7 @@ def main():
     # teacher = main_teacher()
     teacher.eval()
     teacher.cuda()
+
     full_train_set = DefectDataset(set='train', get_mask=False)
     train_size = int(0.9 * len(full_train_set))
     validation_size = len(full_train_set) - train_size
@@ -329,7 +352,8 @@ def main():
     train_loader = DataLoader(train_set, pin_memory=True, batch_size=8, shuffle=True, drop_last=True)
     validation_loader = DataLoader(validation_set, pin_memory=True, batch_size=8)
     test_loader = DataLoader(DefectDataset(set='test', get_mask=True), pin_memory=True, batch_size=1, shuffle=False, drop_last=False)
-    student = StudentTeacherModel(nf=False, channels_hidden=608, n_blocks=4)
+
+    student = StudentTeacherModel(nf=False, channels_hidden=1024, n_blocks=4)
     student.train()
     student.cuda()
 
@@ -339,7 +363,7 @@ def main():
 
     teacher_mean, teacher_std = teacher_normalization(teacher, train_loader)
 
-    train_steps = 10
+    train_steps = 2
     optimizer = torch.optim.Adam(itertools.chain(student.net.parameters(),
                                                  autoencoder.net.parameters()), lr=2e-4, eps=1e-08, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=int(0.95 * train_steps), gamma=0.1)
@@ -355,12 +379,14 @@ def main():
             fg, labels, image, _ = data
             fg, image = [t.to('cuda') for t in [fg, image]]
 
-            # TODO revisit calculation of student loss using fg_down
+            # TODO revisit calculation of student loss using AST loss func
             # fg_down = downsampling(fg, (24, 24), bin=False)
 
             with torch.no_grad():
                 teacher_output_st, _ = teacher(image)
+                #TODO Check if this is needed
                 teacher_output_st = (teacher_output_st - teacher_mean) / teacher_std
+
             student_output_st, _ = student(image)
             student_output_st = student_output_st[:, :304]
 
@@ -403,7 +429,7 @@ def main():
 
     teacher.eval()
 
-    # student = StudentTeacherModel(nf=False, channels_hidden=608, n_blocks=4)
+    # student = StudentTeacherModel(nf=False, channels_hidden=1024, n_blocks=4)
     # student.net.load_state_dict(torch.load('./models/student_bottle.pth'))
     # student.eval()
     # student.cuda()
@@ -568,6 +594,7 @@ def teacher_normalization(teacher, train_loader):
         fg, image = [t.to('cuda') for t in [fg, image]]
 
         teacher_output, _ = teacher(image)
+        # TODO: teacher_output.shape = 8, 304, 24, 24
         mean_output = torch.mean(teacher_output, dim=[0, 2, 3])
         mean_outputs.append(mean_output)
     channel_mean = torch.mean(torch.stack(mean_outputs), dim=0)

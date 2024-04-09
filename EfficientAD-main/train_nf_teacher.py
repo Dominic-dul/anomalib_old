@@ -10,8 +10,6 @@ import itertools
 import os
 import random
 from tqdm import tqdm
-from common import get_autoencoder, get_pdn_small, get_pdn_medium, \
-    ImageFolderWithoutTarget, ImageFolderWithPath, InfiniteDataloader
 from sklearn.metrics import roc_auc_score
 from efficientnet_pytorch import EfficientNet
 import torch.nn.functional as F
@@ -244,7 +242,7 @@ def main_teacher():
                               batch_size=8, shuffle=True, drop_last=True)
     test_loader = DataLoader(DefectDataset(set='test', get_mask=False), pin_memory=True,
                              batch_size=16, shuffle=False, drop_last=False)
-    mean_sc, max_sc, teacher = train(train_loader, test_loader)
+    teacher, mean_sc, max_sc = train(train_loader, test_loader)
     mean_scores.append(mean_sc)
     max_scores.append(max_sc)
 

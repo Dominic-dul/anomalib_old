@@ -11,7 +11,6 @@ import config as c
 
 VERBOSE = False
 
-
 class dummy_data:
     def __init__(self, *dims):
         self.dims = dims
