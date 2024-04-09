@@ -8,7 +8,6 @@ from math import exp
 from torch.autograd import Variable
 
 import config as c
-from utils import *
 
 VERBOSE = False
 

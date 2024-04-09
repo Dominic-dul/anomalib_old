@@ -40,9 +40,9 @@ bg_thresh = 7e-3
 norm_mean, norm_std = [0.485, 0.456, 0.406], [0.229, 0.224, 0.225]
 
 # network hyperparameters
-clamp = 1.9 # clamping parameter
+clamp = 3.0 # clamping parameter
 n_coupling_blocks = 4 # higher = more flexible = more unstable
-channels_hidden_teacher = 64 # number of neurons in hidden layers of internal networks
+channels_hidden_teacher = 1024 # number of neurons in hidden layers of internal networks
 channels_hidden_student = 1024 # number of neurons in hidden layers of student
 use_gamma = True
 kernel_sizes = [3] * (n_coupling_blocks - 1) + [5]
@@ -57,7 +57,7 @@ batch_size = 8
 eval_batch_size = batch_size * 2
 # total epochs = meta_epochs * sub_epochs
 # evaluation after <sub_epochs> epochs
-meta_epochs = 3 # total epochs = meta_epochs * sub_epochs
+meta_epochs = 10 # total epochs = meta_epochs * sub_epochs
 sub_epochs = 24 #batch_size # evaluate after this number of epochs
 
 # output settings

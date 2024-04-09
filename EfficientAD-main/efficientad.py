@@ -25,7 +25,7 @@ import matplotlib.pyplot as plt
 from torchvision.transforms.functional import to_pil_image
 from IPython.display import display
 from torchvision.utils import save_image
-from train_nf_teacher import *
+# from train_nf_teacher import *
 from torchvision.transforms import ToPILImage
 
 def get_argparse():
@@ -55,24 +55,6 @@ def get_argparse():
 
 # constants
 seed = 42
-on_gpu = torch.cuda.is_available()
-out_channels = 384
-image_size = 256
-
-# data loading
-default_transform = transforms.Compose([
-    transforms.Resize((image_size, image_size)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
-transform_ae = transforms.RandomChoice([
-    transforms.ColorJitter(brightness=0.2),
-    transforms.ColorJitter(contrast=0.2),
-    transforms.ColorJitter(saturation=0.2)
-])
-
-def train_transform(image):
-    return default_transform(image), default_transform(transform_ae(image))
 
 class DefectDataset(Dataset):
     def __init__(self, set='train', get_mask=False):
@@ -170,18 +152,20 @@ class FeatureExtractor(nn.Module):
                 return x
 
 # Function to create a normalizing flow model for the teacher.
-def get_nf(input_dim=304, channels_hidden=64):
+def get_nf(input_dim=304, channels_hidden=1024):
     nodes = list()
     # Main input node.
+    nodes.append(InputNode(32, name='input'))
     nodes.append(InputNode(input_dim, name='input'))
     # Creating coupling blocks.
     kernel_sizes = [3, 3, 3, 5]
     for k in range(4):
         nodes.append(Node([nodes[-1].out0], permute_layer, {'seed': k}, name=F'permute_{k}'))
         # Conditional coupling layer if positional encoding is used.
-        nodes.append(Node([nodes[-1].out0], glow_coupling_layer_cond,
-                          {'clamp': 1.9,
+        nodes.append(Node([nodes[-1].out0, nodes[0].out0], glow_coupling_layer_cond,
+                          {'clamp': 3.0,
                            'F_class': F_conv,
+                           'cond_dim': 32,
                            'F_args': {'channels_hidden': channels_hidden,
                                       'kernel_size': kernel_sizes[k]}},
                           name=F'conv_{k}'))
@@ -256,6 +240,31 @@ class Student(nn.Module):
     def jacobian(self, run_forward=False):
         return [0] # Placeholder for Jacobian computation, not applicable for student model.
 
+# Function to create positional encoding.
+def positionalencoding2d(D, H, W):
+    """
+    taken from https://github.com/gudovskiy/cflow-ad
+    :param D: dimension of the model
+    :param H: H of the positions
+    :param W: W of the positions
+    :return: DxHxW position matrix
+    """
+    # Creates a positional encoding matrix.
+    if D % 4 != 0:
+        raise ValueError("Cannot use sin/cos positional encoding with odd dimension (got dim={:d})".format(D))
+    P = torch.zeros(D, H, W)
+    # Each dimension use half of D
+    D = D // 2
+    div_term = torch.exp(torch.arange(0.0, D, 2) * -(np.log(1e4) / D))
+    pos_w = torch.arange(0.0, W).unsqueeze(1)
+    pos_h = torch.arange(0.0, H).unsqueeze(1)
+    P[0:D:2, :, :] = torch.sin(pos_w * div_term).transpose(0, 1).unsqueeze(1).repeat(1, H, 1)
+    P[1:D:2, :, :] = torch.cos(pos_w * div_term).transpose(0, 1).unsqueeze(1).repeat(1, H, 1)
+    P[D::2, :, :] = torch.sin(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, W)
+    P[D + 1::2, :, :] = torch.cos(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, W)
+    # Returns the positional encoding.
+    return P.to('cuda')[None]
+
 class StudentTeacherModel(nn.Module):
     def __init__(self, nf=False, n_blocks=4, channels_hidden=64, model_autoencoder=False):
         super(StudentTeacherModel, self).__init__()
@@ -269,6 +278,8 @@ class StudentTeacherModel(nn.Module):
         else:
             self.net = Student(channels_hidden=channels_hidden, n_blocks=n_blocks)
 
+        self.pos_enc = positionalencoding2d(32, 24, 24)
+
     def forward(self, x):
         # Feature extraction based on the mode and configuration.
         with torch.no_grad():
@@ -276,12 +287,12 @@ class StudentTeacherModel(nn.Module):
 
         inp = f
 
-        # Processing through the network with positional encoding.
-        z = self.net(inp)
-
         if self.model_autoencoder:
-            return z
+            return self.net(inp)
         else:
+            # Processing through the network with positional encoding.
+            cond = self.pos_enc.tile(inp.shape[0], 1, 1, 1)
+            z = self.net([cond, inp])
             # Calculating the Jacobian for the normalizing flow.
             jac = self.net.jacobian(run_forward=False)[0]
             # Returning the transformed input and Jacobian.
@@ -297,6 +308,7 @@ def downsampling(x, size, to_tensor=False, bin=True):
 
 # TODO: for final result, include image penalty from imagenet dataset with 167GB of data
 # TODO: adjust teacher training epochs as per paper
+# TODO: try turnning off gamma
 def main():
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)

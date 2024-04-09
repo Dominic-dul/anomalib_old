@@ -148,10 +148,10 @@ def train(train_loader, test_loader):
     mean_nll_obs = Score_Observer('AUROC mean over maps')
     max_nll_obs = Score_Observer('AUROC  max over maps')
 
-    for epoch in range(2):
+    for epoch in range(10):
         teacher.train()
         print(F'\nTrain epoch {epoch}')
-        for sub_epoch in range(2):
+        for sub_epoch in range(24):
             train_loss = list()
             for i, data in enumerate(tqdm(train_loader, disable=False)):
                 # Clear gradients.
@@ -258,4 +258,4 @@ def main_teacher():
     return teacher
 
 if __name__ == '__main__':
-    main()
+    main_teacher()
