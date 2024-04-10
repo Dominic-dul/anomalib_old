@@ -44,9 +44,6 @@ def get_argparse():
     parser.add_argument('-t', '--train_steps', type=int, default=70000)
     return parser.parse_args()
 
-# constants
-seed = 42
-
 class DefectDataset(Dataset):
     def __init__(self, set='train', get_mask=False):
         super(DefectDataset, self).__init__()
@@ -132,7 +129,6 @@ class FeatureExtractor(nn.Module):
     # Processing through EfficientNet up to specified layer.
     def forward(self, x):
         x = self.feature_extractor._swish(self.feature_extractor._bn0(self.feature_extractor._conv_stem(x)))
-        # Blocks
         for idx, block in enumerate(self.feature_extractor._blocks):
             drop_connect_rate = self.feature_extractor._global_params.drop_connect_rate
             if drop_connect_rate:
@@ -148,8 +144,8 @@ def get_nf(input_dim=304, channels_hidden=1024):
     # Main input node.
     nodes.append(InputNode(32, name='input'))
     nodes.append(InputNode(input_dim, name='input'))
-    # Creating coupling blocks.
     kernel_sizes = [3, 3, 3, 5]
+    # Creating coupling blocks.
     for k in range(4):
         nodes.append(Node([nodes[-1].out0], permute_layer, {'seed': k}, name=F'permute_{k}'))
         # Conditional coupling layer if positional encoding is used.
@@ -160,7 +156,7 @@ def get_nf(input_dim=304, channels_hidden=1024):
                            'F_args': {'channels_hidden': channels_hidden,
                                       'kernel_size': kernel_sizes[k]}},
                           name=F'conv_{k}'))
-    # Output node.
+    # Output node
     nodes.append(OutputNode([nodes[-1].out0], name='output'))
     # Creating the reversible graph net.
     nf = ReversibleGraphNet(nodes, n_jac=1)
@@ -231,7 +227,7 @@ class Student(nn.Module):
         return x
 
     def jacobian(self, run_forward=False):
-        return [0] # Placeholder for Jacobian computation, not applicable for student model.
+        return [0] # Placeholder for Jacobian computation, not applicable for student and autoencoder models.
 
 # Function to create positional encoding.
 def positionalencoding2d(D, H, W):
@@ -260,27 +256,43 @@ def positionalencoding2d(D, H, W):
 
 def get_autoencoder(out_channels=304):
     return nn.Sequential(
-        # Adjusted encoder to prevent too small feature maps
-        nn.Conv2d(in_channels=336, out_channels=32, kernel_size=3, stride=2, padding=1),
+        # encoder
+        nn.Conv2d(in_channels=336, out_channels=32, kernel_size=3, stride=1, padding=1),
+        nn.ReLU(inplace=True),
+        nn.Conv2d(in_channels=32, out_channels=32, kernel_size=3, stride=1, padding=1),
         nn.ReLU(inplace=True),
         nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, stride=2, padding=1),
         nn.ReLU(inplace=True),
-        nn.Conv2d(in_channels=64, out_channels=128, kernel_size=3, stride=1, padding=1),  # Reduced stride to maintain larger feature map size
+        nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1),
         nn.ReLU(inplace=True),
-        nn.Conv2d(in_channels=128, out_channels=256, kernel_size=3, stride=1, padding=1),  # Maintain feature map size
+        nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1),
         nn.ReLU(inplace=True),
-
-        # Carefully adjusted decoder
-        nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),  # Explicitly control upsampling
-        nn.Conv2d(in_channels=256, out_channels=128, kernel_size=3, stride=1, padding=1),
+        nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=0),
         nn.ReLU(inplace=True),
-        nn.Conv2d(in_channels=128, out_channels=64, kernel_size=3, stride=1, padding=1),
+        # decoder
+        nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1),
         nn.ReLU(inplace=True),
-        nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),  # Another controlled upsampling step
-        nn.Conv2d(in_channels=64, out_channels=out_channels, kernel_size=3, stride=1, padding=1),  # Final convolution to adjust channels
-        nn.ReLU(inplace=True)
+        nn.Dropout(0.2),
+        nn.Upsample(scale_factor=2, mode='nearest'),
+        nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1),
+        nn.ReLU(inplace=True),
+        nn.Dropout(0.2),
+        nn.Upsample(scale_factor=2, mode='nearest'),
+        nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1),
+        nn.ReLU(inplace=True),
+        nn.Dropout(0.2),
+        nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1),
+        nn.ReLU(inplace=True),
+        nn.Dropout(0.2),
+        nn.Upsample(scale_factor=2, mode='nearest'),
+        nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1),
+        nn.ReLU(inplace=True),
+        nn.Dropout(0.2),
+        nn.Conv2d(in_channels=64, out_channels=out_channels, kernel_size=3, stride=1, padding=1),
+        nn.ReLU(inplace=True),
+        nn.Dropout(0.2),
+        nn.AdaptiveAvgPool2d((24, 24))
     )
-
 
 class StudentTeacherModel(nn.Module):
     def __init__(self, nf=False, n_blocks=4, channels_hidden=64, model_autoencoder=False):
@@ -326,11 +338,6 @@ def downsampling(x, size, to_tensor=False, bin=True):
     return down
 
 # TODO: for final result, include image penalty from imagenet dataset with 167GB of data
-# TODO: adjust teacher training epochs as per paper
-# TODO: try turnning off gamma
-# TODO: try to improve autoencoder and see if score is better if it is removed
-# TODO: revisit teacher normalization process to see whether it is calculated correctly
-# TODO: Check whether score calculation is correct (0 true is 0 score and same with 1)
 def main():
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
@@ -347,7 +354,7 @@ def main():
     full_train_set = DefectDataset(set='train', get_mask=False)
     train_size = int(0.9 * len(full_train_set))
     validation_size = len(full_train_set) - train_size
-    rng = torch.Generator().manual_seed(seed)
+    rng = torch.Generator().manual_seed(42)
     train_set, validation_set = torch.utils.data.random_split(full_train_set, [train_size, validation_size], rng)
     train_loader = DataLoader(train_set, pin_memory=True, batch_size=8, shuffle=True, drop_last=True)
     validation_loader = DataLoader(validation_set, pin_memory=True, batch_size=8)
@@ -361,14 +368,10 @@ def main():
     autoencoder.train()
     autoencoder.cuda()
 
-    teacher_mean, teacher_std = teacher_normalization(teacher, train_loader)
-
     train_steps = 2
     optimizer = torch.optim.Adam(itertools.chain(student.net.parameters(),
                                                  autoencoder.net.parameters()), lr=2e-4, eps=1e-08, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=int(0.95 * train_steps), gamma=0.1)
 
-    # Currently the best achieved loss for existing saved student and autoencoder models is 21.2708 after 10 epochs
     temp_loss = 150
     temp_loss_general = 200
     for sub_epoch in range(train_steps):
@@ -379,19 +382,16 @@ def main():
             fg, labels, image, _ = data
             fg, image = [t.to('cuda') for t in [fg, image]]
 
-            # TODO revisit calculation of student loss using AST loss func
-            # fg_down = downsampling(fg, (24, 24), bin=False)
+            fg_down = downsampling(fg, (24, 24), bin=False)
 
             with torch.no_grad():
                 teacher_output_st, _ = teacher(image)
-                #TODO Check if this is needed
-                teacher_output_st = (teacher_output_st - teacher_mean) / teacher_std
 
             student_output_st, _ = student(image)
             student_output_st = student_output_st[:, :304]
 
             distance_st = (teacher_output_st - student_output_st) ** 2
-            d_hard = torch.quantile(distance_st, q=0.999)
+            d_hard = torch.quantile(distance_st, q=0.9)
             loss_hard = torch.mean(distance_st[distance_st >= d_hard])
 
             # TODO add image penalty
@@ -400,11 +400,6 @@ def main():
             ae_output = autoencoder(image)
             with torch.no_grad():
                 teacher_output_ae, _ = teacher(image)
-                # print(f"teacher_output_ae shape: {teacher_output_ae.shape}")
-                # print(f"ae_output shape: {ae_output.shape}")
-                # print(f"teacher_output_ae: {teacher_output_ae}")
-                # print(f"ae_output: {ae_output}")
-                teacher_output_ae = (teacher_output_ae - teacher_mean) / teacher_std
             student_output_ae, _ = student(image)
             student_output_ae = student_output_ae[:, 304:]
             distance_ae = (teacher_output_ae - ae_output) ** 2
@@ -416,16 +411,16 @@ def main():
             optimizer.zero_grad()
             loss_total.backward()
             optimizer.step()
-            scheduler.step()
 
+            print(f'Loss after epoch: {loss_total.item()}')
             if (loss_total.item() < temp_loss):
                 temp_loss = loss_total.item()
+                torch.save(student.net.state_dict(), join('./models', 'student_bottle.pth'))
+                torch.save(autoencoder.net.state_dict(), join('./models', 'autoencoder_bottle.pth'))
 
         if (temp_loss < temp_loss_general):
             temp_loss_general = temp_loss
             print("Current best loss: {:.4f}  ".format(temp_loss_general))
-            torch.save(student.net.state_dict(), join('./models', 'student_bottle.pth'))
-            torch.save(autoencoder.net.state_dict(), join('./models', 'autoencoder_bottle.pth'))
 
     teacher.eval()
 
@@ -444,19 +439,16 @@ def main():
 
     q_st_start, q_st_end, q_ae_start, q_ae_end = map_normalization(
         validation_loader=validation_loader, teacher=teacher, student=student,
-        autoencoder=autoencoder, teacher_mean=teacher_mean,
-        teacher_std=teacher_std, desc='Final map normalization')
+        autoencoder=autoencoder, desc='Final map normalization')
     test_output_dir = 'output/anomaly_maps/bottle'
     auc = test(
         test_loader=test_loader, teacher=teacher, student=student,
-        autoencoder=autoencoder, teacher_mean=teacher_mean,
-        teacher_std=teacher_std, q_st_start=q_st_start, q_st_end=q_st_end,
+        autoencoder=autoencoder, q_st_start=q_st_start, q_st_end=q_st_end,
         q_ae_start=q_ae_start, q_ae_end=q_ae_end,
         test_output_dir=test_output_dir, desc='Final inference')
-    # Best image auc: 96.9048
     print('Final image auc: {:.4f}'.format(auc))
 
-def test(test_loader, teacher, student, autoencoder, teacher_mean, teacher_std,
+def test(test_loader, teacher, student, autoencoder,
          q_st_start, q_st_end, q_ae_start, q_ae_end, test_output_dir=None,
          desc='Running inference'):
     y_true = []
@@ -476,18 +468,12 @@ def test(test_loader, teacher, student, autoencoder, teacher_mean, teacher_std,
 
         map_combined, map_st, map_ae = predict(
             image=image, teacher=teacher, student=student,
-            autoencoder=autoencoder, teacher_mean=teacher_mean,
-            teacher_std=teacher_std, q_st_start=q_st_start, q_st_end=q_st_end,
+            autoencoder=autoencoder, q_st_start=q_st_start, q_st_end=q_st_end,
             q_ae_start=q_ae_start, q_ae_end=q_ae_end)
         map_combined = torch.nn.functional.pad(map_combined, (4, 4, 4, 4))
         map_combined = torch.nn.functional.interpolate(
             map_combined, (orig_height, orig_width), mode='bilinear')
         map_combined = map_combined[0, 0].cpu().numpy()
-
-        # map_min = map_combined.min()
-        # map_max = map_combined.max()
-        # map_normalized = (map_combined - map_min) / (map_max - map_min)
-        # map_inverted = 1.0 - map_normalized
 
         defect_class = defect_classes[labels.item()]
         if test_output_dir is not None:
@@ -526,13 +512,6 @@ def test(test_loader, teacher, student, autoencoder, teacher_mean, teacher_std,
 
         mask_flat = mask.flatten().cpu().numpy()
         map_flat = map_combined.flatten()
-        # print(f"\nDefect class: {defect_class}")
-        # print(f'Map flat size: {map_flat.size}')
-        # print(f'Mask flat size: {map_flat.size}')
-        # print(f"\nMap combined contains {np.sum(map_flat >= 0.5)} elements that are higher or equal to 0.5")
-        # print(f"\nMap combined contains {np.sum(map_flat < 0.5)} elements that are lower than 0.5")
-        # print(f"\nMask contains {np.sum(mask_flat >= 0.5)} elements that are higher or equal to 0.5")
-        # print(f"\nMask contains {np.sum(mask_flat < 0.5)} elements that are lower than 0.5")
         mask_flat_combined.extend(mask_flat)
         map_flat_combined.extend(map_flat)
 
@@ -543,10 +522,8 @@ def test(test_loader, teacher, student, autoencoder, teacher_mean, teacher_std,
     return auc * 100
 
 @torch.no_grad()
-def predict(image, teacher, student, autoencoder, teacher_mean, teacher_std,
-            q_st_start=None, q_st_end=None, q_ae_start=None, q_ae_end=None):
+def predict(image, teacher, student, autoencoder, q_st_start=None, q_st_end=None, q_ae_start=None, q_ae_end=None):
     teacher_output, _ = teacher(image)
-    teacher_output = (teacher_output - teacher_mean) / teacher_std
     student_output, _ = student(image)
     autoencoder_output = autoencoder(image)
     map_st = torch.mean((teacher_output - student_output[:, :304])**2,
@@ -562,8 +539,7 @@ def predict(image, teacher, student, autoencoder, teacher_mean, teacher_std,
     return map_combined, map_st, map_ae
 
 @torch.no_grad()
-def map_normalization(validation_loader, teacher, student, autoencoder,
-                      teacher_mean, teacher_std, desc='Map normalization'):
+def map_normalization(validation_loader, teacher, student, autoencoder, desc='Map normalization'):
     maps_st = []
     maps_ae = []
     # ignore augmented ae image
@@ -573,8 +549,7 @@ def map_normalization(validation_loader, teacher, student, autoencoder,
 
         map_combined, map_st, map_ae = predict(
             image=image, teacher=teacher, student=student,
-            autoencoder=autoencoder, teacher_mean=teacher_mean,
-            teacher_std=teacher_std)
+            autoencoder=autoencoder)
         maps_st.append(map_st)
         maps_ae.append(map_ae)
     maps_st = torch.cat(maps_st)
@@ -584,36 +559,6 @@ def map_normalization(validation_loader, teacher, student, autoencoder,
     q_ae_start = torch.quantile(maps_ae, q=0.9)
     q_ae_end = torch.quantile(maps_ae, q=0.995)
     return q_st_start, q_st_end, q_ae_start, q_ae_end
-
-@torch.no_grad()
-def teacher_normalization(teacher, train_loader):
-
-    mean_outputs = []
-    for i, data in enumerate(tqdm(train_loader, desc='Computing mean of features')):
-        fg, labels, image, _ = data
-        fg, image = [t.to('cuda') for t in [fg, image]]
-
-        teacher_output, _ = teacher(image)
-        # TODO: teacher_output.shape = 8, 304, 24, 24
-        mean_output = torch.mean(teacher_output, dim=[0, 2, 3])
-        mean_outputs.append(mean_output)
-    channel_mean = torch.mean(torch.stack(mean_outputs), dim=0)
-    channel_mean = channel_mean[None, :, None, None]
-
-    mean_distances = []
-    for i, data in enumerate(tqdm(train_loader, desc='Computing std of features')):
-        fg, labels, image, _ = data
-        fg, image = [t.to('cuda') for t in [fg, image]]
-
-        teacher_output, _ = teacher(image)
-        distance = (teacher_output - channel_mean) ** 2
-        mean_distance = torch.mean(distance, dim=[0, 2, 3])
-        mean_distances.append(mean_distance)
-    channel_var = torch.mean(torch.stack(mean_distances), dim=0)
-    channel_var = channel_var[None, :, None, None]
-    channel_std = torch.sqrt(channel_var)
-
-    return channel_mean, channel_std
 
 if __name__ == '__main__':
     main()
