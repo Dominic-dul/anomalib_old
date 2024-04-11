@@ -17,6 +17,7 @@ from freia_funcs import *
 import torch.nn as nn
 from PIL import Image
 from os.path import join
+import matplotlib.pyplot as plt
 # from train_nf_teacher import main_teacher
 
 def get_argparse():
@@ -261,7 +262,7 @@ def get_autoencoder(out_channels=304):
         nn.ReLU(inplace=True),
         nn.Conv2d(in_channels=32, out_channels=32, kernel_size=3, stride=1, padding=1),
         nn.ReLU(inplace=True),
-        nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, stride=2, padding=1),
+        nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, stride=1, padding=1),
         nn.ReLU(inplace=True),
         nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1),
         nn.ReLU(inplace=True),
@@ -310,11 +311,10 @@ class StudentTeacherModel(nn.Module):
         self.pos_enc = positionalencoding2d(32, 24, 24)
 
     def forward(self, x):
-        # Feature extraction based on the mode and configuration.
+        # Feature extraction
         with torch.no_grad():
-            f = self.feature_extractor(x)
+            inp = self.feature_extractor(x)
 
-        inp = f
         # Processing through the network with positional encoding.
         cond = self.pos_enc.tile(inp.shape[0], 1, 1, 1)
 
@@ -337,7 +337,6 @@ def downsampling(x, size, to_tensor=False, bin=True):
         down[down > 0] = 1
     return down
 
-# TODO: for final result, include image penalty from imagenet dataset with 167GB of data
 def main():
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
@@ -368,10 +367,11 @@ def main():
     autoencoder.train()
     autoencoder.cuda()
 
-    train_steps = 2
-    optimizer = torch.optim.Adam(itertools.chain(student.net.parameters(),
-                                                 autoencoder.net.parameters()), lr=2e-4, eps=1e-08, weight_decay=1e-5)
+    train_steps = 5
+    optimizer = torch.optim.Adam(itertools.chain(student.net.parameters(), autoencoder.net.parameters()), lr=2e-4, eps=1e-08, weight_decay=1e-5)
 
+    # TODO: try reduce on plateau, cos schedulers
+    # TODO: collect, draw and save loss-curve
     temp_loss = 150
     temp_loss_general = 200
     for sub_epoch in range(train_steps):
@@ -391,10 +391,10 @@ def main():
             student_output_st = student_output_st[:, :304]
 
             distance_st = (teacher_output_st - student_output_st) ** 2
-            d_hard = torch.quantile(distance_st, q=0.9)
+            d_hard = torch.quantile(distance_st, q=0.999)
             loss_hard = torch.mean(distance_st[distance_st >= d_hard])
 
-            # TODO add image penalty
+            # TODO add image penalty from imagenet dataset with 167GB of data
             loss_st = loss_hard
 
             ae_output = autoencoder(image)
@@ -412,9 +412,12 @@ def main():
             loss_total.backward()
             optimizer.step()
 
+            # TODO: try to implement early-stopping
+
             print(f'Loss after epoch: {loss_total.item()}')
             if (loss_total.item() < temp_loss):
                 temp_loss = loss_total.item()
+                # Try to save the whole model instead of state_dict()
                 torch.save(student.net.state_dict(), join('./models', 'student_bottle.pth'))
                 torch.save(autoencoder.net.state_dict(), join('./models', 'autoencoder_bottle.pth'))
 
@@ -437,20 +440,12 @@ def main():
     student.eval()
     autoencoder.eval()
 
-    q_st_start, q_st_end, q_ae_start, q_ae_end = map_normalization(
-        validation_loader=validation_loader, teacher=teacher, student=student,
-        autoencoder=autoencoder, desc='Final map normalization')
     test_output_dir = 'output/anomaly_maps/bottle'
-    auc = test(
-        test_loader=test_loader, teacher=teacher, student=student,
-        autoencoder=autoencoder, q_st_start=q_st_start, q_st_end=q_st_end,
-        q_ae_start=q_ae_start, q_ae_end=q_ae_end,
-        test_output_dir=test_output_dir, desc='Final inference')
+    auc, pixel_roc_auc = test(test_loader=test_loader, teacher=teacher, student=student, autoencoder=autoencoder, test_output_dir=test_output_dir, desc='Final inference')
+    print(f'\nFinal pixel auc : {pixel_roc_auc}')
     print('Final image auc: {:.4f}'.format(auc))
 
-def test(test_loader, teacher, student, autoencoder,
-         q_st_start, q_st_end, q_ae_start, q_ae_end, test_output_dir=None,
-         desc='Running inference'):
+def test(test_loader, teacher, student, autoencoder, test_output_dir=None, desc='Running inference'):
     y_true = []
     y_score = []
     mask_flat_combined = []
@@ -466,18 +461,20 @@ def test(test_loader, teacher, student, autoencoder,
 
         fg, image, mask = [t.to('cuda') for t in [fg, image, mask]]
 
-        map_combined, map_st, map_ae = predict(
-            image=image, teacher=teacher, student=student,
-            autoencoder=autoencoder, q_st_start=q_st_start, q_st_end=q_st_end,
-            q_ae_start=q_ae_start, q_ae_end=q_ae_end)
+        map_combined, map_st, map_ae = predict(image=image, teacher=teacher, student=student, autoencoder=autoencoder)
         map_combined = torch.nn.functional.pad(map_combined, (4, 4, 4, 4))
         map_combined = torch.nn.functional.interpolate(
             map_combined, (orig_height, orig_width), mode='bilinear')
         map_combined = map_combined[0, 0].cpu().numpy()
+        map_combined_unhanged = map_combined
+
+        map_combined = 1 / (1 + np.exp(-map_combined))
+        print(f'\nmax value of map_combined: {map_combined.max()}')
+        print(f'min value of map_combined: {map_combined.min()}')
+        map_combined = (map_combined > 0.75).astype(np.float32)
 
         defect_class = defect_classes[labels.item()]
         if test_output_dir is not None:
-            # TODO: make this the name of original image
             img_nm = image_name[0]
             # Saving images as png:
             if not os.path.exists(os.path.join(test_output_dir, defect_class)):
@@ -486,79 +483,45 @@ def test(test_loader, teacher, student, autoencoder,
             image_to_save = Image.fromarray((map_combined * 255).astype(np.uint8))
             image_to_save.save(file)
 
-            test_output_dir_tiff = 'output/anomaly_maps/bottle_tiff'
-            # Saving images as tiff
-            if not os.path.exists(os.path.join(test_output_dir_tiff, defect_class)):
-                os.makedirs(os.path.join(test_output_dir_tiff, defect_class))
-            file_tiff = os.path.join(test_output_dir_tiff, defect_class, img_nm + '.tiff')
-            tifffile.imwrite(file_tiff, map_combined)
+            #Saving images heatmap
+            test_output_dir_heat = 'output/anomaly_maps/bottle_heat'
+            if not os.path.exists(os.path.join(test_output_dir_heat, defect_class)):
+                os.makedirs(os.path.join(test_output_dir_heat, defect_class))
+            plt.imshow(map_combined_unhanged, cmap='hot', interpolation='nearest')
+            plt.axis('off')
+            plt.savefig(os.path.join(test_output_dir_heat, defect_class, img_nm + '.png'), bbox_inches='tight', pad_inches=0)
 
-            # Saving masks for checking if correct ones are saved
-            # test_output_dir_mask = 'output/anomaly_maps/masks'
-            # if not os.path.exists(os.path.join(test_output_dir_mask, defect_class)):
-            #     os.makedirs(os.path.join(test_output_dir_mask, defect_class))
-            # mask_file = os.path.join(test_output_dir_mask, defect_class, img_nm + '_mask.png')
-            #
-            # mask_temp = mask.squeeze().cpu().numpy()
-            # image_to_save = Image.fromarray((mask_temp * 255).astype(np.uint8))
-            # image_to_save.save(mask_file)
-
-        map_combined = 1 / (1 + np.exp(-map_combined))
 
         y_true_image = 0 if defect_class == "good" else 1
-        y_score_image = np.max(map_combined)
+        y_score_image = np.max(map_combined_unhanged)
         y_true.append(y_true_image)
         y_score.append(y_score_image)
 
         mask_flat = mask.flatten().cpu().numpy()
-        map_flat = map_combined.flatten()
+        map_flat = map_combined_unhanged.flatten()
         mask_flat_combined.extend(mask_flat)
         map_flat_combined.extend(map_flat)
 
+    # Draw and save roc curve
+    # Draw and save precision and recall curve
     pixel_roc_auc = roc_auc_score(y_true=mask_flat_combined, y_score=map_flat_combined)
-    print(f'\nROC-AUC pixel score: {pixel_roc_auc * 100}')
-
     auc = roc_auc_score(y_true=y_true, y_score=y_score)
-    return auc * 100
+    return auc * 100, pixel_roc_auc * 100
 
 @torch.no_grad()
-def predict(image, teacher, student, autoencoder, q_st_start=None, q_st_end=None, q_ae_start=None, q_ae_end=None):
+def predict(image, teacher, student, autoencoder):
+    # Generate predictions using the teacher model
     teacher_output, _ = teacher(image)
+    # Generate predictions using the student model
     student_output, _ = student(image)
+    # Generate reconstructions using the autoencoder
     autoencoder_output = autoencoder(image)
-    map_st = torch.mean((teacher_output - student_output[:, :304])**2,
-                        dim=1, keepdim=True)
-    map_ae = torch.mean((autoencoder_output -
-                         student_output[:, 304:])**2,
-                        dim=1, keepdim=True)
-    if q_st_start is not None:
-        map_st = 0.1 * (map_st - q_st_start) / (q_st_end - q_st_start)
-    if q_ae_start is not None:
-        map_ae = 0.1 * (map_ae - q_ae_start) / (q_ae_end - q_ae_start)
+    # Calculate the mean squared error (MSE) between the teacher and student outputs
+    map_st = torch.mean((teacher_output - student_output[:, :304])**2, dim=1, keepdim=True)
+    # Calculate the MSE between the autoencoder output and the student output
+    map_ae = torch.mean((autoencoder_output - student_output[:, 304:])**2, dim=1, keepdim=True)
     map_combined = 0.5 * map_st + 0.5 * map_ae
     return map_combined, map_st, map_ae
-
-@torch.no_grad()
-def map_normalization(validation_loader, teacher, student, autoencoder, desc='Map normalization'):
-    maps_st = []
-    maps_ae = []
-    # ignore augmented ae image
-    for data in tqdm(validation_loader, desc=desc):
-        fg, labels, image, _ = data
-        fg, image = [t.to('cuda') for t in [fg, image]]
-
-        map_combined, map_st, map_ae = predict(
-            image=image, teacher=teacher, student=student,
-            autoencoder=autoencoder)
-        maps_st.append(map_st)
-        maps_ae.append(map_ae)
-    maps_st = torch.cat(maps_st)
-    maps_ae = torch.cat(maps_ae)
-    q_st_start = torch.quantile(maps_st, q=0.9)
-    q_st_end = torch.quantile(maps_st, q=0.995)
-    q_ae_start = torch.quantile(maps_ae, q=0.9)
-    q_ae_end = torch.quantile(maps_ae, q=0.995)
-    return q_st_start, q_st_end, q_ae_start, q_ae_end
 
 if __name__ == '__main__':
     main()

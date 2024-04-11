@@ -7,7 +7,6 @@ feature_dir = 'data/features/' # directory where features are stored and loaded 
 use_3D_dataset = False # is MVTec 3D used?
 pre_extracted = False # were feature pre-extracted with extract_features? (recommended)
 modelname = "my_experiment" # export evaluations/logs with this name
-print(modelname)
 
 # inputs
 img_len = 768 # width/height of input imagef
