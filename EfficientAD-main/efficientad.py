@@ -422,7 +422,7 @@ def main():
             if (loss_total.item() < temp_loss):
                 temp_loss = loss_total.item()
                 # Try to save the whole model instead of state_dict()
-                  TODO make this (bottle) dynamic
+                # TODO make this (bottle) dynamic
                 torch.save(student, join('./models', 'student_bottle.pth'))
                 torch.save(autoencoder, join('./models', 'autoencoder_bottle.pth'))
 
@@ -433,21 +433,16 @@ def main():
 
     save_loss_graph(train_loss, test_output_dir)
 
+    # TODO make this (bottle) dynamic
+    student = torch.load('./models/student_bottle.pth')
     student.eval()
+    student.cuda()
+    # TODO make this (bottle) dynamic
+    autoencoder = torch.load('./models/autoencoder_bottle.pth')
     autoencoder.eval()
+    autoencoder.cuda()
 
-    teacher.eval()
-
-    # # TODO make this (bottle) dynamic
-    # student = torch.load('./models/student_bottle.pth')
-    # student.eval()
-    # student.cuda()
-    # # TODO make this (bottle) dynamic
-    # autoencoder = torch.load('./models/autoencoder_bottle.pth')
-    # autoencoder.eval()
-    # autoencoder.cuda()
-
-    auc, pixel_roc_auc, image_f1, pixel_f1, image_recall, image_precision, pixel_recall, pixel_precision, latency = test(test_loader=test_loader, teacher=teacher, student=student, autoencoder=autoencoder, test_output_dir=test_output_dir, desc='Final inference')
+    auc, pixel_roc_auc, image_f1, pixel_f1, image_recall, image_precision, pixel_recall, pixel_precision, latency = test(test_loader=test_loader, teacher=teacher, student=student, autoencoder=autoencoder, test_output_dir=test_output_dir, desc='Final inference', calculate_other_metrics=True)
     print('Final pixel auc: {:.4f}'.format(pixel_roc_auc))
     print('Final image auc: {:.4f}'.format(auc))
     print('Final pixel f1: {:.4f}'.format(pixel_f1))
@@ -476,7 +471,7 @@ def predict(image, teacher, student, autoencoder):
     map_combined = 0.5 * map_st + 0.5 * map_ae
     return map_combined, map_st, map_ae, latency_ms
 
-def test(test_loader, teacher, student, autoencoder, test_output_dir=None, desc='Running inference'):
+def test(test_loader, teacher, student, autoencoder, test_output_dir=None, desc='Running inference', calculate_other_metrics=False):
     y_true = []
     y_score = []
     y_score_binary = []
@@ -542,29 +537,32 @@ def test(test_loader, teacher, student, autoencoder, test_output_dir=None, desc=
     auc = roc_auc_score(y_true=y_true, y_score=y_score)
     auc = auc * 100
 
-    image_f1_threshold, pixel_f1_threshold = save_curves(map_flat_combined, mask_flat_combined, y_score, y_true, auc, pixel_roc_auc, test_output_dir)
+    if calculate_other_metrics:
+        image_f1_threshold, pixel_f1_threshold = save_curves(map_flat_combined, mask_flat_combined, y_score, y_true, auc, pixel_roc_auc, test_output_dir)
 
-    # Saving predicted masks as png with the best calculated threshold:
-    save_predicted_masks(mask_save_data, pixel_f1_threshold)
+        # Saving predicted masks as png with the best calculated threshold:
+        save_predicted_masks(mask_save_data, pixel_f1_threshold)
 
-    # Convert image and pixel predictions to binary with optimap thresholds
-    y_score_binary = (y_score > image_f1_threshold).astype(np.float32)
-    map_flat_combined_binary = (map_flat_combined > pixel_f1_threshold).astype(np.float32)
+        # Convert image and pixel predictions to binary with optimap thresholds
+        y_score_binary = (y_score > image_f1_threshold).astype(np.float32)
+        map_flat_combined_binary = (map_flat_combined > pixel_f1_threshold).astype(np.float32)
 
-    # image-level f1 calculations
-    image_f1 = f1_score(y_true=y_true, y_pred=y_score_binary)
-    # pixel-level f1 calculations
-    pixel_f1 = f1_score(y_true=mask_flat_combined, y_pred=map_flat_combined_binary)
+        # image-level f1 calculations
+        image_f1 = f1_score(y_true=y_true, y_pred=y_score_binary)
+        # pixel-level f1 calculations
+        pixel_f1 = f1_score(y_true=mask_flat_combined, y_pred=map_flat_combined_binary)
 
-    # image-level precision and recall calculations
-    image_recall = recall_score(y_true, y_score_binary)
-    image_precision = precision_score(y_true, y_score_binary)
-    # pixel-level precision and recall calculations
-    pixel_recall = recall_score(mask_flat_combined, map_flat_combined_binary)
-    pixel_precision = precision_score(mask_flat_combined, map_flat_combined_binary)
+        # image-level precision and recall calculations
+        image_recall = recall_score(y_true, y_score_binary)
+        image_precision = precision_score(y_true, y_score_binary)
+        # pixel-level precision and recall calculations
+        pixel_recall = recall_score(mask_flat_combined, map_flat_combined_binary)
+        pixel_precision = precision_score(mask_flat_combined, map_flat_combined_binary)
 
-    average_latency = sum(latencies) / len(latencies)
-    return auc, pixel_roc_auc, image_f1 * 100, pixel_f1 * 100, image_recall * 100, image_precision * 100, pixel_recall * 100, pixel_precision * 100, average_latency
+        average_latency = sum(latencies) / len(latencies)
+        return auc, pixel_roc_auc, image_f1 * 100, pixel_f1 * 100, image_recall * 100, image_precision * 100, pixel_recall * 100, pixel_precision * 100, average_latency
+    else:
+        return auc, pixel_roc_auc
 
 def save_predicted_masks(save_data, threshold):
     for directory_path, file_path, mask in save_data:
