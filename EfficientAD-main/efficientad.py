@@ -10,7 +10,7 @@ import itertools
 import os
 import random
 from tqdm import tqdm
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import roc_auc_score, roc_curve, precision_recall_curve, f1_score, precision_score, recall_score
 from efficientnet_pytorch import EfficientNet
 import torch.nn.functional as F
 from freia_funcs import *
@@ -18,6 +18,7 @@ import torch.nn as nn
 from PIL import Image
 from os.path import join
 import matplotlib.pyplot as plt
+import time
 # from train_nf_teacher import main_teacher
 
 def get_argparse():
@@ -56,6 +57,7 @@ class DefectDataset(Dataset):
         self.get_mask = get_mask
         self.image_transforms = transforms.Compose([transforms.Resize((768, 768)), transforms.ToTensor(),
                                                     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
+        # TODO make this (bottle) dynamic
         root = join('./mvtec_anomaly_detection/', 'bottle')
         set_dir = os.path.join(root, set)
         subclass = os.listdir(set_dir)
@@ -268,7 +270,7 @@ def get_autoencoder(out_channels=304):
         nn.ReLU(inplace=True),
         nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1),
         nn.ReLU(inplace=True),
-        nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=0),
+        nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1),
         nn.ReLU(inplace=True),
         # decoder
         nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1),
@@ -343,10 +345,11 @@ def main():
     torch.cuda.manual_seed_all(42)
     np.random.seed(42)
     random.seed(42)
+    # TODO make this (bottle) dynamic
+    test_output_dir = 'output/anomaly_maps/bottle'
 
-    teacher = StudentTeacherModel(nf=True)
-    teacher.net.load_state_dict(torch.load('./models/teacher_nf_bottle.pth'))
-    # teacher = main_teacher()
+    # TODO make this (bottle) dynamic
+    teacher = torch.load('./models/teacher_nf_bottle.pth')
     teacher.eval()
     teacher.cuda()
 
@@ -367,13 +370,13 @@ def main():
     autoencoder.train()
     autoencoder.cuda()
 
-    train_steps = 5
+    train_steps = 1
     optimizer = torch.optim.Adam(itertools.chain(student.net.parameters(), autoencoder.net.parameters()), lr=2e-4, eps=1e-08, weight_decay=1e-5)
 
     # TODO: try reduce on plateau, cos schedulers
-    # TODO: collect, draw and save loss-curve
     temp_loss = 150
     temp_loss_general = 200
+    train_loss = []
     for sub_epoch in range(train_steps):
         train_loss = list()
         print('Epoch {} out of {}'.format(sub_epoch+1, train_steps))
@@ -415,41 +418,72 @@ def main():
             # TODO: try to implement early-stopping
 
             print(f'Loss after epoch: {loss_total.item()}')
+            train_loss.append(loss_total.item())
             if (loss_total.item() < temp_loss):
                 temp_loss = loss_total.item()
                 # Try to save the whole model instead of state_dict()
-                torch.save(student.net.state_dict(), join('./models', 'student_bottle.pth'))
-                torch.save(autoencoder.net.state_dict(), join('./models', 'autoencoder_bottle.pth'))
+                  TODO make this (bottle) dynamic
+                torch.save(student, join('./models', 'student_bottle.pth'))
+                torch.save(autoencoder, join('./models', 'autoencoder_bottle.pth'))
+
 
         if (temp_loss < temp_loss_general):
             temp_loss_general = temp_loss
             print("Current best loss: {:.4f}  ".format(temp_loss_general))
 
-    teacher.eval()
-
-    # student = StudentTeacherModel(nf=False, channels_hidden=1024, n_blocks=4)
-    # student.net.load_state_dict(torch.load('./models/student_bottle.pth'))
-    # student.eval()
-    # student.cuda()
-    #
-    # autoencoder = StudentTeacherModel(model_autoencoder=True)
-    # autoencoder.net.load_state_dict(torch.load('./models/autoencoder_bottle.pth'))
-    # autoencoder.eval()
-    # autoencoder.cuda()
+    save_loss_graph(train_loss, test_output_dir)
 
     student.eval()
     autoencoder.eval()
 
-    test_output_dir = 'output/anomaly_maps/bottle'
-    auc, pixel_roc_auc = test(test_loader=test_loader, teacher=teacher, student=student, autoencoder=autoencoder, test_output_dir=test_output_dir, desc='Final inference')
-    print(f'\nFinal pixel auc : {pixel_roc_auc}')
+    teacher.eval()
+
+    # # TODO make this (bottle) dynamic
+    # student = torch.load('./models/student_bottle.pth')
+    # student.eval()
+    # student.cuda()
+    # # TODO make this (bottle) dynamic
+    # autoencoder = torch.load('./models/autoencoder_bottle.pth')
+    # autoencoder.eval()
+    # autoencoder.cuda()
+
+    auc, pixel_roc_auc, image_f1, pixel_f1, image_recall, image_precision, pixel_recall, pixel_precision, latency = test(test_loader=test_loader, teacher=teacher, student=student, autoencoder=autoencoder, test_output_dir=test_output_dir, desc='Final inference')
+    print('Final pixel auc: {:.4f}'.format(pixel_roc_auc))
     print('Final image auc: {:.4f}'.format(auc))
+    print('Final pixel f1: {:.4f}'.format(pixel_f1))
+    print('Final image f1: {:.4f}'.format(image_f1))
+    print('Final pixel recall: {:.4f}'.format(pixel_recall))
+    print('Final image recall: {:.4f}'.format(image_recall))
+    print('Final pixel precision: {:.4f}'.format(pixel_precision))
+    print('Final image precision: {:.4f}'.format(image_precision))
+    print('Final average processing latency: {:.4f} ms/img'.format(latency))
+
+@torch.no_grad()
+def predict(image, teacher, student, autoencoder):
+    start_time = time.time()
+    # Generate predictions using the teacher model
+    teacher_output, _ = teacher(image)
+    # Generate predictions using the student model
+    student_output, _ = student(image)
+    # Generate reconstructions using the autoencoder
+    autoencoder_output = autoencoder(image)
+    end_time = time.time()
+    latency_ms = (end_time - start_time) * 1000
+    # Calculate the mean squared error (MSE) between the teacher and student outputs
+    map_st = torch.mean((teacher_output - student_output[:, :304])**2, dim=1, keepdim=True)
+    # Calculate the MSE between the autoencoder output and the student output
+    map_ae = torch.mean((autoencoder_output - student_output[:, 304:])**2, dim=1, keepdim=True)
+    map_combined = 0.5 * map_st + 0.5 * map_ae
+    return map_combined, map_st, map_ae, latency_ms
 
 def test(test_loader, teacher, student, autoencoder, test_output_dir=None, desc='Running inference'):
     y_true = []
     y_score = []
+    y_score_binary = []
     mask_flat_combined = []
     map_flat_combined = []
+    latencies = []
+    mask_save_data = []
 
     for data in tqdm(test_loader, desc=desc):
         fg, labels, image, image_name, mask = data
@@ -457,71 +491,201 @@ def test(test_loader, teacher, student, autoencoder, test_output_dir=None, desc=
         orig_width = W
         orig_height = H
 
+        # TODO make this dynamic
         defect_classes = ["good", "broken_large", "broken_small", "contamination"]
 
         fg, image, mask = [t.to('cuda') for t in [fg, image, mask]]
 
-        map_combined, map_st, map_ae = predict(image=image, teacher=teacher, student=student, autoencoder=autoencoder)
+        map_combined, map_st, map_ae, latency_ms = predict(image=image, teacher=teacher, student=student, autoencoder=autoencoder)
         map_combined = torch.nn.functional.pad(map_combined, (4, 4, 4, 4))
         map_combined = torch.nn.functional.interpolate(
             map_combined, (orig_height, orig_width), mode='bilinear')
         map_combined = map_combined[0, 0].cpu().numpy()
-        map_combined_unhanged = map_combined
-
         map_combined = 1 / (1 + np.exp(-map_combined))
-        print(f'\nmax value of map_combined: {map_combined.max()}')
-        print(f'min value of map_combined: {map_combined.min()}')
-        map_combined = (map_combined > 0.75).astype(np.float32)
+
+        latencies.append(latency_ms)
 
         defect_class = defect_classes[labels.item()]
         if test_output_dir is not None:
             img_nm = image_name[0]
-            # Saving images as png:
-            if not os.path.exists(os.path.join(test_output_dir, defect_class)):
-                os.makedirs(os.path.join(test_output_dir, defect_class))
-            file = os.path.join(test_output_dir, defect_class, img_nm + '.png')
-            image_to_save = Image.fromarray((map_combined * 255).astype(np.uint8))
-            image_to_save.save(file)
+            mask_save_data.append((os.path.join(test_output_dir, defect_class), os.path.join(test_output_dir, defect_class, img_nm + '.png'), map_combined))
 
             #Saving images heatmap
+            # TODO make this (bottle) dynamic
             test_output_dir_heat = 'output/anomaly_maps/bottle_heat'
             if not os.path.exists(os.path.join(test_output_dir_heat, defect_class)):
                 os.makedirs(os.path.join(test_output_dir_heat, defect_class))
-            plt.imshow(map_combined_unhanged, cmap='hot', interpolation='nearest')
+            dpi = 100
+            fig_size = 768 / dpi
+            fig = plt.figure(figsize=(fig_size, fig_size), dpi=dpi)
+            ax = fig.add_axes([0, 0, 1, 1])
+            ax.set_axis_off()
+            heatmap = ax.imshow(map_combined, cmap='hot', interpolation='nearest')
             plt.axis('off')
-            plt.savefig(os.path.join(test_output_dir_heat, defect_class, img_nm + '.png'), bbox_inches='tight', pad_inches=0)
-
+            fig.savefig(os.path.join(test_output_dir_heat, defect_class, img_nm + '.png'), dpi=dpi, bbox_inches='tight', pad_inches=0)
+            plt.close(fig)
 
         y_true_image = 0 if defect_class == "good" else 1
-        y_score_image = np.max(map_combined_unhanged)
+        y_score_image = np.max(map_combined)
         y_true.append(y_true_image)
         y_score.append(y_score_image)
 
         mask_flat = mask.flatten().cpu().numpy()
-        map_flat = map_combined_unhanged.flatten()
+        map_flat = map_combined.flatten()
         mask_flat_combined.extend(mask_flat)
         map_flat_combined.extend(map_flat)
 
-    # Draw and save roc curve
-    # Draw and save precision and recall curve
+    # pixel-level auc calculations
     pixel_roc_auc = roc_auc_score(y_true=mask_flat_combined, y_score=map_flat_combined)
+    pixel_roc_auc = pixel_roc_auc * 100
+    # image-level auc calculations
     auc = roc_auc_score(y_true=y_true, y_score=y_score)
-    return auc * 100, pixel_roc_auc * 100
+    auc = auc * 100
 
-@torch.no_grad()
-def predict(image, teacher, student, autoencoder):
-    # Generate predictions using the teacher model
-    teacher_output, _ = teacher(image)
-    # Generate predictions using the student model
-    student_output, _ = student(image)
-    # Generate reconstructions using the autoencoder
-    autoencoder_output = autoencoder(image)
-    # Calculate the mean squared error (MSE) between the teacher and student outputs
-    map_st = torch.mean((teacher_output - student_output[:, :304])**2, dim=1, keepdim=True)
-    # Calculate the MSE between the autoencoder output and the student output
-    map_ae = torch.mean((autoencoder_output - student_output[:, 304:])**2, dim=1, keepdim=True)
-    map_combined = 0.5 * map_st + 0.5 * map_ae
-    return map_combined, map_st, map_ae
+    image_f1_threshold, pixel_f1_threshold = save_curves(map_flat_combined, mask_flat_combined, y_score, y_true, auc, pixel_roc_auc, test_output_dir)
+
+    # Saving predicted masks as png with the best calculated threshold:
+    save_predicted_masks(mask_save_data, pixel_f1_threshold)
+
+    # Convert image and pixel predictions to binary with optimap thresholds
+    y_score_binary = (y_score > image_f1_threshold).astype(np.float32)
+    map_flat_combined_binary = (map_flat_combined > pixel_f1_threshold).astype(np.float32)
+
+    # image-level f1 calculations
+    image_f1 = f1_score(y_true=y_true, y_pred=y_score_binary)
+    # pixel-level f1 calculations
+    pixel_f1 = f1_score(y_true=mask_flat_combined, y_pred=map_flat_combined_binary)
+
+    # image-level precision and recall calculations
+    image_recall = recall_score(y_true, y_score_binary)
+    image_precision = precision_score(y_true, y_score_binary)
+    # pixel-level precision and recall calculations
+    pixel_recall = recall_score(mask_flat_combined, map_flat_combined_binary)
+    pixel_precision = precision_score(mask_flat_combined, map_flat_combined_binary)
+
+    average_latency = sum(latencies) / len(latencies)
+    return auc, pixel_roc_auc, image_f1 * 100, pixel_f1 * 100, image_recall * 100, image_precision * 100, pixel_recall * 100, pixel_precision * 100, average_latency
+
+def save_predicted_masks(save_data, threshold):
+    for directory_path, file_path, mask in save_data:
+        if not os.path.exists(directory_path):
+            os.makedirs(directory_path)
+
+        mask = (mask > threshold).astype(np.float32)
+        image_to_save = Image.fromarray((mask * 255).astype(np.uint8))
+        image_to_save.save(file_path)
+
+def save_curves(pixel_prediction, pixel_gt, image_predictions, image_gt, image_auc, pixel_auc, location):
+    # For pixel-level ROC curve
+    fpr_pixel, tpr_pixel, thresholds_pixel = roc_curve(y_true=pixel_gt, y_score=pixel_prediction)
+    # For image-level ROC curve
+    fpr, tpr, thresholds = roc_curve(y_true=image_gt, y_score=image_predictions)
+    # For pixel-level precision-recall curve
+    precision_pixel, recall_pixel, thresholds_f1_pixel = precision_recall_curve(pixel_gt, pixel_prediction)
+    # For image-level precision-recall curve
+    precision, recall, thresholds_f1 = precision_recall_curve(image_gt, image_predictions)
+
+    # Optimal threshold for image f1 calculation
+    f1_scores = []
+    for p, r in zip(precision, recall):
+        if (p + r) != 0:
+            f1 = 2 * p * r / (p + r)
+        else:
+            f1 = 0  # Define F1 as 0 if both precision and recall are zero
+        f1_scores.append(f1)
+
+    optimal_idx = np.argmax(f1_scores)
+    optimal_threshold = thresholds_f1[optimal_idx]
+    print(f"optimal image f1 threshold: {optimal_threshold}")
+
+    # Optimal threshold for pixel f1 calculation
+    f1_scores_pixel = []
+    for p, r in zip(precision_pixel, recall_pixel):
+        if (p + r) != 0:
+            f1 = 2 * p * r / (p + r)
+        else:
+            f1 = 0  # Define F1 as 0 if both precision and recall are zero
+        f1_scores_pixel.append(f1)
+
+    optimal_idx_pixel = np.argmax(f1_scores_pixel)
+    optimal_threshold_pixel = thresholds_f1_pixel[optimal_idx_pixel]
+    print(f"optimal pixel f1 threshold: {optimal_threshold_pixel}")
+
+    if not os.path.exists(os.path.join(location, 'graphs')):
+        os.makedirs(os.path.join(location, 'graphs'))
+
+    # Plotting the image-level Precision-Recall curve
+    plt.figure(figsize=(8, 6))
+    plt.plot(recall, precision, label='Precision-Recall Curve', color='navy')
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.title('Precision-Recall Curve Image-Level')
+    plt.legend(loc="best")
+    plt.grid(True)
+    pr_path = os.path.join(location, 'graphs', 'precision_recall_image.png')
+    plt.savefig(pr_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # Plotting the pixel-level Precision-Recall curve
+    plt.figure(figsize=(8, 6))
+    plt.plot(recall_pixel, precision_pixel, label='Precision-Recall Curve', color='navy')
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.title('Precision-Recall Curve Pixel-Level')
+    plt.legend(loc="best")
+    plt.grid(True)
+    pr_pixel_path = os.path.join(location, 'graphs', 'precision_recall_pixel.png')
+    plt.savefig(pr_pixel_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # Plotting and saving the pixel-level ROC curve
+    plt.figure()
+    plt.plot(fpr_pixel, tpr_pixel, color='darkorange', lw=2, label='Pixel ROC curve (area = %0.2f)' % pixel_auc)
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Pixel-level Receiver Operating Characteristic')
+    plt.legend(loc="lower right")
+    pixel_roc_path = os.path.join(location, 'graphs', 'pixel_roc.png')
+    plt.savefig(pixel_roc_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    # Plotting and saving the image-level ROC curve
+    plt.figure()
+    plt.plot(fpr, tpr, color='blue', lw=2, label='Overall ROC curve (area = %0.2f)' % image_auc)
+    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Image-level Receiver Operating Characteristic')
+    plt.legend(loc="lower right")
+    image_roc_path = os.path.join(location, 'graphs', 'image_roc.png')
+    plt.savefig(image_roc_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+    print(f"Pixel-level ROC curve image saved to '{pixel_roc_path}'.")
+    print(f"Image-level ROC curve image saved to '{image_roc_path}'.")
+    print(f"Pixel-level precision-recall curve image saved to '{pr_pixel_path}'.")
+    print(f"Image-level precision-recall curve image saved to '{pr_path}'.")
+
+    return optimal_threshold, optimal_threshold_pixel
+
+def save_loss_graph(train_loss, location):
+    plt.figure(figsize=(10, 5))
+    plt.plot(train_loss, label='Training Loss')
+    plt.xlabel('Iteration')
+    plt.ylabel('Loss')
+    plt.title('Training Loss Over Iterations')
+    plt.legend()
+    plt.grid(True)
+    loss_path = os.path.join(location, 'graphs', 'training_loss.png')
+    plt.savefig(loss_path)
+    plt.close()
+
+    print(f"Training loss curve image saved to '{loss_path}'.")
 
 if __name__ == '__main__':
     main()
