@@ -370,7 +370,11 @@ def main():
     autoencoder.train()
     autoencoder.cuda()
 
-    train_steps = 1
+    train_steps = 100
+    patience = 10
+    best_auc = 0
+    epochs_to_improve = 0
+    early_stop = False
     optimizer = torch.optim.Adam(itertools.chain(student.net.parameters(), autoencoder.net.parameters()), lr=2e-4, eps=1e-08, weight_decay=1e-5)
 
     # TODO: try reduce on plateau, cos schedulers
@@ -380,6 +384,9 @@ def main():
     for sub_epoch in range(train_steps):
         train_loss = list()
         print('Epoch {} out of {}'.format(sub_epoch+1, train_steps))
+        epoch_loss = 0
+        student.train()
+        autoencoder.train()
         for i, data in enumerate(tqdm(train_loader, disable=True)):
             optimizer.zero_grad()
             fg, labels, image, _ = data
@@ -419,13 +426,36 @@ def main():
 
             print(f'Loss after epoch: {loss_total.item()}')
             train_loss.append(loss_total.item())
-            if (loss_total.item() < temp_loss):
-                temp_loss = loss_total.item()
-                # Try to save the whole model instead of state_dict()
-                # TODO make this (bottle) dynamic
-                torch.save(student, join('./models', 'student_bottle.pth'))
-                torch.save(autoencoder, join('./models', 'autoencoder_bottle.pth'))
+            epoch_loss += loss_total.item()
 
+            # if (loss_total.item() < temp_loss):
+            #     temp_loss = loss_total.item()
+            #     # Try to save the whole model instead of state_dict()
+            #     # TODO make this (bottle) dynamic
+            #     torch.save(student, join('./models', 'student_bottle.pth'))
+            #     torch.save(autoencoder, join('./models', 'autoencoder_bottle.pth'))
+        avg_epoch_loss = epoch_loss / len(train_loader)
+        print(f'Average loss after epoch {sub_epoch + 1}: {avg_epoch_loss}')
+
+        student.eval()
+        autoencoder.eval()
+        image_auc, pixel_auc = test(test_loader=test_loader, teacher=teacher, student=student, autoencoder=autoencoder, test_output_dir=test_output_dir, desc='Final inference', calculate_other_metrics=False)
+
+        print(f'Validation pixel AUC after epoch {sub_epoch + 1}: {pixel_auc}')
+
+        # Check for early stopping
+        if pixel_auc > best_auc:
+            best_auc = pixel_auc
+            epochs_no_improve = 0
+            # Save best model
+            torch.save(student, join('./models', 'student_bottle.pth'))
+            torch.save(autoencoder, join('./models', 'autoencoder_bottle.pth'))
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve == patience:
+                print('Early stopping!')
+                early_stop = True
+                break
 
         if (temp_loss < temp_loss_general):
             temp_loss_general = temp_loss
@@ -480,7 +510,7 @@ def test(test_loader, teacher, student, autoencoder, test_output_dir=None, desc=
     latencies = []
     mask_save_data = []
 
-    for data in tqdm(test_loader, desc=desc):
+    for data in tqdm(test_loader, desc=desc, disable=True):
         fg, labels, image, image_name, mask = data
         _, C, H, W = image.shape
         orig_width = W
@@ -501,7 +531,7 @@ def test(test_loader, teacher, student, autoencoder, test_output_dir=None, desc=
         latencies.append(latency_ms)
 
         defect_class = defect_classes[labels.item()]
-        if test_output_dir is not None:
+        if test_output_dir is not None and calculate_other_metrics:
             img_nm = image_name[0]
             mask_save_data.append((os.path.join(test_output_dir, defect_class), os.path.join(test_output_dir, defect_class, img_nm + '.png'), map_combined))
 
