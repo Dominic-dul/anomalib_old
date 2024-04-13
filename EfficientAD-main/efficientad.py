@@ -375,8 +375,8 @@ def main():
     autoencoder.train()
     autoencoder.cuda()
 
-    if not test_only:
-        train_steps = train_steps_config
+    if test_only == "False":
+        train_steps = int(train_steps_config)
         patience = 10
         best_auc = 0
         epochs_to_improve = 0
@@ -406,15 +406,12 @@ def main():
 
                 distance_st = (teacher_output_st - student_output_st) ** 2
                 loss_hard = torch.mean(distance_st)
-                # d_hard = torch.quantile(distance_st, q=0.999)
-                # loss_hard = torch.mean(distance_st[distance_st >= d_hard])
 
                 # Imagenet penalty
-                # student_output_penalty, _ = student(penalty_image)
-                # student_output_penalty = student_output_penalty[:, :304]
-                # loss_penalty = torch.mean(student_output_penalty**2)
-                # loss_st = loss_hard + loss_penalty
-                loss_st = loss_hard
+                student_output_penalty, _ = student(penalty_image)
+                student_output_penalty = student_output_penalty[:, :304]
+                loss_penalty = torch.mean(student_output_penalty**2)
+                loss_st = loss_hard + loss_penalty
 
                 ae_output = autoencoder(image)
                 with torch.no_grad():
@@ -515,9 +512,7 @@ def test(test_loader, teacher, student, autoencoder, test_output_dir=None, desc=
         image, mask = [t.to('cuda') for t in [image, mask]]
 
         map_combined, map_st, map_ae, latency_ms = predict(image=image, teacher=teacher, student=student, autoencoder=autoencoder)
-        map_combined = torch.nn.functional.pad(map_combined, (4, 4, 4, 4))
-        map_combined = torch.nn.functional.interpolate(
-            map_combined, (orig_height, orig_width), mode='bilinear')
+        map_combined = torch.nn.functional.interpolate(map_combined, (orig_height, orig_width), mode='bilinear')
         map_combined = map_combined[0, 0].cpu().numpy()
         map_combined = 1 / (1 + np.exp(-map_combined))
 
