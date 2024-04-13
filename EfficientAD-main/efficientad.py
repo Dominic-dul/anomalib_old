@@ -19,33 +19,11 @@ from PIL import Image
 from os.path import join
 import matplotlib.pyplot as plt
 import time
-# from train_nf_teacher import main_teacher
 
 def get_argparse():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-d', '--dataset', default='mvtec_ad',
-                        choices=['mvtec_ad', 'mvtec_loco'])
-    parser.add_argument('-s', '--subdataset', default='bottle',
-                        help='One of 15 sub-datasets of Mvtec AD or 5' +
-                             'sub-datasets of Mvtec LOCO')
-    parser.add_argument('-o', '--output_dir', default='output/1')
-    parser.add_argument('-m', '--model_size', default='small',
-                        choices=['small', 'medium'])
-    parser.add_argument('-w', '--weights', default='models/teacher_small.pth')
-    parser.add_argument('-i', '--imagenet_train_path',
-                        default='none',
-                        help='Set to "none" to disable ImageNet' +
-                             'pretraining penalty. Or see README.md to' +
-                             'download ImageNet and set to ImageNet path')
-    parser.add_argument('-a', '--mvtec_ad_path',
-                        default='./mvtec_anomaly_detection',
-                        help='Downloaded Mvtec AD dataset')
-    parser.add_argument('-b', '--mvtec_loco_path',
-                        default='./mvtec_loco_anomaly_detection',
-                        help='Downloaded Mvtec LOCO dataset')
-    parser.add_argument('-t', '--train_steps', type=int, default=70000)
+    parser.add_argument('-s', '--subdataset', default='bottle')
     return parser.parse_args()
-
 
 class ImageNetDataset(Dataset):
     def __init__(self, root_dir, sample_size=None):
@@ -70,7 +48,7 @@ class ImageNetDataset(Dataset):
         return image
 
 class DefectDataset(Dataset):
-    def __init__(self, set='train', get_mask=False):
+    def __init__(self, set='train', get_mask=False, subdataset='bottle'):
         super(DefectDataset, self).__init__()
         self.set = set
         self.labels = list()
@@ -78,15 +56,9 @@ class DefectDataset(Dataset):
         self.images = list()
         self.class_names = ['good']
         self.get_mask = get_mask
+        self.defect_classes = []
         self.image_transforms = transforms.Compose([transforms.Resize((768, 768)), transforms.ToTensor(), transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
-        self.train_image_transforms = transforms.Compose([transforms.RandomResizedCrop(768, scale=(0.8, 1.0), ratio=(0.9, 1.1)),
-                                                    transforms.RandomHorizontalFlip(),
-                                                    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-                                                    transforms.Resize((768, 768)),
-                                                    transforms.ToTensor(),
-                                                    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
-        # TODO make this (bottle) dynamic
-        root = join('./mvtec_anomaly_detection/', 'bottle')
+        root = join('./mvtec_anomaly_detection/', subdataset)
         set_dir = os.path.join(root, set)
         subclass = os.listdir(set_dir)
         subclass.sort()
@@ -109,6 +81,7 @@ class DefectDataset(Dataset):
                     continue
                 self.images.append(i_path)
                 self.labels.append(label)
+                self.defect_classes.append(sc)
 
             if self.get_mask and self.set != 'train' and sc != 'good':
                 mask_dir = os.path.join(root, 'ground_truth', sc)
@@ -126,11 +99,7 @@ class DefectDataset(Dataset):
 
         with open(self.images[index], 'rb') as f:
             img = Image.open(f).convert('RGB')
-
-        if self.set == 'train':
-            img = self.train_image_transforms(img)
-        else:
-            img = self.image_transforms(img)
+        img = self.image_transforms(img)
 
         image_name = os.path.splitext(os.path.basename(self.images[index]))[0]
         label = self.labels[index]
@@ -152,6 +121,7 @@ class DefectDataset(Dataset):
                 mask = mask_transforms(mask)
                 mask = (mask > 0.5).float()
             ret.append(mask)
+            ret.append(self.defect_classes[index])
         return ret
 
 class FeatureExtractor(nn.Module):
@@ -372,27 +342,28 @@ def downsampling(x, size, to_tensor=False, bin=True):
     return down
 
 def main():
+    config = get_argparse()
+    subdataset = config.subdataset
+
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
     torch.cuda.manual_seed_all(42)
     np.random.seed(42)
     random.seed(42)
-    # TODO make this (bottle) dynamic
-    test_output_dir = 'output/anomaly_maps/bottle'
+    test_output_dir = os.path.join('output/results', subdataset)
 
-    # TODO make this (bottle) dynamic
-    teacher = torch.load('./models/teacher_nf_bottle.pth')
+    teacher = torch.load('./models/teacher_nf_' + subdataset + '.pth')
     teacher.eval()
     teacher.cuda()
 
-    full_train_set = DefectDataset(set='train', get_mask=False)
+    full_train_set = DefectDataset(set='train', get_mask=False, subdataset=subdataset)
     train_size = int(0.9 * len(full_train_set))
     validation_size = len(full_train_set) - train_size
     rng = torch.Generator().manual_seed(42)
     train_set, validation_set = torch.utils.data.random_split(full_train_set, [train_size, validation_size], rng)
     train_loader = DataLoader(train_set, pin_memory=True, batch_size=8, shuffle=True, drop_last=True)
     validation_loader = DataLoader(validation_set, pin_memory=True, batch_size=8)
-    test_loader = DataLoader(DefectDataset(set='test', get_mask=True), pin_memory=True, batch_size=1, shuffle=False, drop_last=False)
+    test_loader = DataLoader(DefectDataset(set='test', get_mask=True, subdataset=subdataset), pin_memory=True, batch_size=1, shuffle=False, drop_last=False)
 
     imagenet_path = './imagenet_pictures/collected_images'
     penalty_set = ImageNetDataset(imagenet_path, sample_size=train_size)
@@ -423,7 +394,6 @@ def main():
         student.train()
         autoencoder.train()
         for (mvtec_data, penalty_data) in zip(tqdm(train_loader, disable=True), penalty_loader):
-            optimizer.zero_grad()
             fg, labels, image, _ = mvtec_data
             penalty_image = penalty_data
             fg, image, penalty_image = [t.to('cuda') for t in [fg, image, penalty_image]]
@@ -461,18 +431,10 @@ def main():
             loss_total.backward()
             optimizer.step()
 
-            # TODO: try to implement early-stopping
-
             print(f'Loss after epoch: {loss_total.item()}')
             train_loss.append(loss_total.item())
             epoch_loss += loss_total.item()
 
-            # if (loss_total.item() < temp_loss):
-            #     temp_loss = loss_total.item()
-            #     # Try to save the whole model instead of state_dict()
-            #     # TODO make this (bottle) dynamic
-            #     torch.save(student, join('./models', 'student_bottle.pth'))
-            #     torch.save(autoencoder, join('./models', 'autoencoder_bottle.pth'))
         avg_epoch_loss = epoch_loss / len(train_loader)
         print(f'Average loss after epoch {sub_epoch + 1}: {avg_epoch_loss}')
 
@@ -487,8 +449,8 @@ def main():
             best_auc = pixel_auc
             epochs_no_improve = 0
             # Save best model
-            torch.save(student, join('./models', 'student_bottle.pth'))
-            torch.save(autoencoder, join('./models', 'autoencoder_bottle.pth'))
+            torch.save(student, join('./models', 'student_' + subdataset + '.pth'))
+            torch.save(autoencoder, join('./models', 'autoencoder_' + subdataset + '.pth'))
         else:
             epochs_no_improve += 1
             if epochs_no_improve == patience:
@@ -496,18 +458,12 @@ def main():
                 early_stop = True
                 break
 
-        if (temp_loss < temp_loss_general):
-            temp_loss_general = temp_loss
-            print("Current best loss: {:.4f}  ".format(temp_loss_general))
+    save_loss_graph(train_loss, os.path.join(test_output_dir, 'graphs'))
 
-    save_loss_graph(train_loss, test_output_dir)
-
-    # TODO make this (bottle) dynamic
-    student = torch.load('./models/student_bottle.pth')
+    student = torch.load('./models/student_' + subdataset + '.pth')
     student.eval()
     student.cuda()
-    # TODO make this (bottle) dynamic
-    autoencoder = torch.load('./models/autoencoder_bottle.pth')
+    autoencoder = torch.load('./models/autoencoder_' + subdataset + '.pth')
     autoencoder.eval()
     autoencoder.cuda()
 
@@ -550,13 +506,11 @@ def test(test_loader, teacher, student, autoencoder, test_output_dir=None, desc=
     mask_save_data = []
 
     for data in tqdm(test_loader, desc=desc, disable=True):
-        fg, labels, image, image_name, mask = data
+        fg, labels, image, image_name, mask, defect_class = data
+        defect_class = defect_class[0]
         _, C, H, W = image.shape
         orig_width = W
         orig_height = H
-
-        # TODO make this dynamic
-        defect_classes = ["good", "broken_large", "broken_small", "contamination"]
 
         fg, image, mask = [t.to('cuda') for t in [fg, image, mask]]
 
@@ -569,14 +523,13 @@ def test(test_loader, teacher, student, autoencoder, test_output_dir=None, desc=
 
         latencies.append(latency_ms)
 
-        defect_class = defect_classes[labels.item()]
+        test_output_dir_images = os.path.join(test_output_dir, 'images')
         if test_output_dir is not None and calculate_other_metrics:
             img_nm = image_name[0]
-            mask_save_data.append((os.path.join(test_output_dir, defect_class), os.path.join(test_output_dir, defect_class, img_nm + '.png'), map_combined))
+            mask_save_data.append((os.path.join(test_output_dir_images, 'masks', defect_class), os.path.join(test_output_dir_images, 'masks', defect_class, img_nm + '.png'), map_combined))
 
             #Saving images heatmap
-            # TODO make this (bottle) dynamic
-            test_output_dir_heat = 'output/anomaly_maps/bottle_heat'
+            test_output_dir_heat = os.path.join(test_output_dir_images, 'heat_maps')
             if not os.path.exists(os.path.join(test_output_dir_heat, defect_class)):
                 os.makedirs(os.path.join(test_output_dir_heat, defect_class))
             dpi = 100
@@ -607,7 +560,7 @@ def test(test_loader, teacher, student, autoencoder, test_output_dir=None, desc=
     auc = auc * 100
 
     if calculate_other_metrics:
-        image_f1_threshold, pixel_f1_threshold, optimal_threshold_auc = save_curves(map_flat_combined, mask_flat_combined, y_score, y_true, auc, pixel_roc_auc, test_output_dir)
+        image_f1_threshold, pixel_f1_threshold, optimal_threshold_auc = save_curves(map_flat_combined, mask_flat_combined, y_score, y_true, auc, pixel_roc_auc, os.path.join(test_output_dir, 'graphs'))
 
         # Saving predicted masks as png with the best calculated threshold:
         save_predicted_masks(mask_save_data, optimal_threshold_auc)
@@ -642,7 +595,7 @@ def save_predicted_masks(save_data, threshold):
         image_to_save = Image.fromarray((mask * 255).astype(np.uint8))
         image_to_save.save(file_path)
 
-def save_curves(pixel_prediction, pixel_gt, image_predictions, image_gt, image_auc, pixel_auc, location):
+def save_curves(pixel_prediction, pixel_gt, image_predictions, image_gt, image_auc, pixel_auc, output_dir):
     # For pixel-level ROC curve
     fpr_pixel, tpr_pixel, thresholds_pixel = roc_curve(y_true=pixel_gt, y_score=pixel_prediction)
     # For image-level ROC curve
@@ -683,8 +636,8 @@ def save_curves(pixel_prediction, pixel_gt, image_predictions, image_gt, image_a
     optimal_threshold_pixel = thresholds_f1_pixel[optimal_idx_pixel]
     print(f"optimal pixel f1 threshold: {optimal_threshold_pixel}")
 
-    if not os.path.exists(os.path.join(location, 'graphs')):
-        os.makedirs(os.path.join(location, 'graphs'))
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
 
     # Plotting the image-level Precision-Recall curve
     plt.figure(figsize=(8, 6))
@@ -694,7 +647,7 @@ def save_curves(pixel_prediction, pixel_gt, image_predictions, image_gt, image_a
     plt.title('Precision-Recall Curve Image-Level')
     plt.legend(loc="best")
     plt.grid(True)
-    pr_path = os.path.join(location, 'graphs', 'precision_recall_image.png')
+    pr_path = os.path.join(output_dir, 'precision_recall_image.png')
     plt.savefig(pr_path, dpi=300, bbox_inches='tight')
     plt.close()
 
@@ -706,7 +659,7 @@ def save_curves(pixel_prediction, pixel_gt, image_predictions, image_gt, image_a
     plt.title('Precision-Recall Curve Pixel-Level')
     plt.legend(loc="best")
     plt.grid(True)
-    pr_pixel_path = os.path.join(location, 'graphs', 'precision_recall_pixel.png')
+    pr_pixel_path = os.path.join(output_dir, 'precision_recall_pixel.png')
     plt.savefig(pr_pixel_path, dpi=300, bbox_inches='tight')
     plt.close()
 
@@ -720,7 +673,7 @@ def save_curves(pixel_prediction, pixel_gt, image_predictions, image_gt, image_a
     plt.ylabel('True Positive Rate')
     plt.title('Pixel-level Receiver Operating Characteristic')
     plt.legend(loc="lower right")
-    pixel_roc_path = os.path.join(location, 'graphs', 'pixel_roc.png')
+    pixel_roc_path = os.path.join(output_dir, 'pixel_roc.png')
     plt.savefig(pixel_roc_path, dpi=300, bbox_inches='tight')
     plt.close()
 
@@ -734,7 +687,7 @@ def save_curves(pixel_prediction, pixel_gt, image_predictions, image_gt, image_a
     plt.ylabel('True Positive Rate')
     plt.title('Image-level Receiver Operating Characteristic')
     plt.legend(loc="lower right")
-    image_roc_path = os.path.join(location, 'graphs', 'image_roc.png')
+    image_roc_path = os.path.join(output_dir, 'image_roc.png')
     plt.savefig(image_roc_path, dpi=300, bbox_inches='tight')
     plt.close()
 
@@ -745,7 +698,7 @@ def save_curves(pixel_prediction, pixel_gt, image_predictions, image_gt, image_a
 
     return optimal_threshold, optimal_threshold_pixel, optimal_threshold_auc
 
-def save_loss_graph(train_loss, location):
+def save_loss_graph(train_loss, output_dir):
     plt.figure(figsize=(10, 5))
     plt.plot(train_loss, label='Training Loss')
     plt.xlabel('Iteration')
@@ -753,7 +706,10 @@ def save_loss_graph(train_loss, location):
     plt.title('Training Loss Over Iterations')
     plt.legend()
     plt.grid(True)
-    loss_path = os.path.join(location, 'graphs', 'training_loss.png')
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    loss_path = os.path.join(output_dir, 'training_loss.png')
     plt.savefig(loss_path)
     plt.close()
 

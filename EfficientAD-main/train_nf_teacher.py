@@ -21,6 +21,11 @@ from scipy.ndimage.morphology import binary_dilation
 from torchvision.datasets import ImageFolder
 from efficientad import StudentTeacherModel, get_nf, FeatureExtractor
 
+def get_argparse():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-s', '--subdataset', default='bottle')
+    return parser.parse_args()
+
 class Score_Observer:
     '''Keeps an eye on the current and highest score so far'''
 
@@ -69,7 +74,7 @@ def get_nf_loss(z, jac, mask=None, per_sample=False, per_pixel=False):
     return loss_per_sample.mean()
 
 class DefectDataset(Dataset):
-    def __init__(self, set='train', get_mask=True):
+    def __init__(self, set='train', get_mask=True, subdataset='bottle'):
         super(DefectDataset, self).__init__()
         self.set = set
         self.labels = list()
@@ -79,7 +84,7 @@ class DefectDataset(Dataset):
         self.get_mask = get_mask
         self.image_transforms = transforms.Compose([transforms.Resize((768, 768)), transforms.ToTensor(),
                                                     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
-        root = join('./mvtec_anomaly_detection/', 'bottle')
+        root = join('./mvtec_anomaly_detection/', subdataset)
         set_dir = os.path.join(root, set)
         subclass = os.listdir(set_dir)
         subclass.sort()
@@ -138,7 +143,7 @@ class DefectDataset(Dataset):
         ret = [fg, label, img]
         return ret
 
-def train(train_loader, test_loader):
+def train(train_loader, test_loader, subdataset='bottle'):
     teacher = StudentTeacherModel(nf=True)
     teacher.cuda()
     optimizer = torch.optim.Adam(teacher.net.parameters(), lr=2e-4, eps=1e-08, weight_decay=1e-5)
@@ -223,26 +228,25 @@ def train(train_loader, test_loader):
     if not os.path.exists('./models'):
         os.makedirs('./models')
     teacher.to('cpu')
-    torch.save(teacher.net.state_dict(), join('./models', 'teacher_nf_bottle.pth'))
+    torch.save(teacher, join('./models', 'teacher_nf_' + subdataset + '.pth'))
     print('teacher saved!')
     teacher.to('cuda')
 
     return teacher, mean_nll_obs, max_nll_obs
 
 def main_teacher():
-    # all_classes = [d for d in os.listdir('./mvtec_anomaly_detection/') if os.path.isdir(join('./mvtec_anomaly_detection/', d))]
-    # print(all_classes)
+    config = get_argparse()
+    subdataset = config.subdataset
+
     max_scores = list()
     mean_scores = list()
-    # Make it a 'for' loop iterating through all the classes rather than just bottle
-    # for i_c, cn in enumerate(all_classes):
-    # c.class_name = cn
-    print('\n\nTrain class ' + 'bottle')
-    train_loader = DataLoader(DefectDataset(set='train', get_mask=False), pin_memory=True,
+
+    print('\nTrain class ' + subdataset)
+    train_loader = DataLoader(DefectDataset(set='train', get_mask=False, subdataset=subdataset), pin_memory=True,
                               batch_size=8, shuffle=True, drop_last=True)
-    test_loader = DataLoader(DefectDataset(set='test', get_mask=False), pin_memory=True,
+    test_loader = DataLoader(DefectDataset(set='test', get_mask=False, subdataset=subdataset), pin_memory=True,
                              batch_size=16, shuffle=False, drop_last=False)
-    teacher, mean_sc, max_sc = train(train_loader, test_loader)
+    teacher, mean_sc, max_sc = train(train_loader, test_loader, subdataset)
     mean_scores.append(mean_sc)
     max_scores.append(max_sc)
 
