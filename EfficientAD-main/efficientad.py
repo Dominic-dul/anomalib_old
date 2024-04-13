@@ -46,6 +46,29 @@ def get_argparse():
     parser.add_argument('-t', '--train_steps', type=int, default=70000)
     return parser.parse_args()
 
+
+class ImageNetDataset(Dataset):
+    def __init__(self, root_dir, sample_size=None):
+        self.transform = transforms.Compose([transforms.Resize((768, 768)),
+                                             transforms.ToTensor(),
+                                             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+                                             transforms.RandomGrayscale(0.3),
+                                             transforms.CenterCrop(768)])
+
+        self.image_paths = [os.path.join(root_dir, f) for f in os.listdir(root_dir) if os.path.isfile(os.path.join(root_dir, f))]
+
+        if sample_size is not None and sample_size < len(self.image_paths):
+            self.image_paths = random.sample(self.image_paths, sample_size)
+
+    def __len__(self):
+        return len(self.image_paths)
+
+    def __getitem__(self, index):
+        with open(self.image_paths[index], 'rb') as f:
+            image = Image.open(f).convert('RGB')
+        image = self.transform(image)
+        return image
+
 class DefectDataset(Dataset):
     def __init__(self, set='train', get_mask=False):
         super(DefectDataset, self).__init__()
@@ -55,7 +78,12 @@ class DefectDataset(Dataset):
         self.images = list()
         self.class_names = ['good']
         self.get_mask = get_mask
-        self.image_transforms = transforms.Compose([transforms.Resize((768, 768)), transforms.ToTensor(),
+        self.image_transforms = transforms.Compose([transforms.Resize((768, 768)), transforms.ToTensor(), transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
+        self.train_image_transforms = transforms.Compose([transforms.RandomResizedCrop(768, scale=(0.8, 1.0), ratio=(0.9, 1.1)),
+                                                    transforms.RandomHorizontalFlip(),
+                                                    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+                                                    transforms.Resize((768, 768)),
+                                                    transforms.ToTensor(),
                                                     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
         # TODO make this (bottle) dynamic
         root = join('./mvtec_anomaly_detection/', 'bottle')
@@ -98,7 +126,11 @@ class DefectDataset(Dataset):
 
         with open(self.images[index], 'rb') as f:
             img = Image.open(f).convert('RGB')
-        img = self.image_transforms(img)
+
+        if self.set == 'train':
+            img = self.train_image_transforms(img)
+        else:
+            img = self.image_transforms(img)
 
         image_name = os.path.splitext(os.path.basename(self.images[index]))[0]
         label = self.labels[index]
@@ -362,6 +394,10 @@ def main():
     validation_loader = DataLoader(validation_set, pin_memory=True, batch_size=8)
     test_loader = DataLoader(DefectDataset(set='test', get_mask=True), pin_memory=True, batch_size=1, shuffle=False, drop_last=False)
 
+    imagenet_path = './imagenet_pictures/collected_images'
+    penalty_set = ImageNetDataset(imagenet_path, sample_size=train_size)
+    penalty_loader = DataLoader(penalty_set, pin_memory=True, batch_size=8, shuffle=True, drop_last=True)
+
     student = StudentTeacherModel(nf=False, channels_hidden=1024, n_blocks=4)
     student.train()
     student.cuda()
@@ -382,15 +418,15 @@ def main():
     temp_loss_general = 200
     train_loss = []
     for sub_epoch in range(train_steps):
-        train_loss = list()
         print('Epoch {} out of {}'.format(sub_epoch+1, train_steps))
         epoch_loss = 0
         student.train()
         autoencoder.train()
-        for i, data in enumerate(tqdm(train_loader, disable=True)):
+        for (mvtec_data, penalty_data) in zip(tqdm(train_loader, disable=True), penalty_loader):
             optimizer.zero_grad()
-            fg, labels, image, _ = data
-            fg, image = [t.to('cuda') for t in [fg, image]]
+            fg, labels, image, _ = mvtec_data
+            penalty_image = penalty_data
+            fg, image, penalty_image = [t.to('cuda') for t in [fg, image, penalty_image]]
 
             fg_down = downsampling(fg, (24, 24), bin=False)
 
@@ -404,8 +440,11 @@ def main():
             d_hard = torch.quantile(distance_st, q=0.999)
             loss_hard = torch.mean(distance_st[distance_st >= d_hard])
 
-            # TODO add image penalty from imagenet dataset with 167GB of data
-            loss_st = loss_hard
+            # Imagenet penalty
+            student_output_penalty, _ = student(penalty_image)
+            student_output_penalty = student_output_penalty[:, :304]
+            loss_penalty = torch.mean(student_output_penalty**2)
+            loss_st = loss_hard + loss_penalty
 
             ae_output = autoencoder(image)
             with torch.no_grad():
@@ -568,10 +607,10 @@ def test(test_loader, teacher, student, autoencoder, test_output_dir=None, desc=
     auc = auc * 100
 
     if calculate_other_metrics:
-        image_f1_threshold, pixel_f1_threshold = save_curves(map_flat_combined, mask_flat_combined, y_score, y_true, auc, pixel_roc_auc, test_output_dir)
+        image_f1_threshold, pixel_f1_threshold, optimal_threshold_auc = save_curves(map_flat_combined, mask_flat_combined, y_score, y_true, auc, pixel_roc_auc, test_output_dir)
 
         # Saving predicted masks as png with the best calculated threshold:
-        save_predicted_masks(mask_save_data, pixel_f1_threshold)
+        save_predicted_masks(mask_save_data, optimal_threshold_auc)
 
         # Convert image and pixel predictions to binary with optimap thresholds
         y_score_binary = (y_score > image_f1_threshold).astype(np.float32)
@@ -612,6 +651,11 @@ def save_curves(pixel_prediction, pixel_gt, image_predictions, image_gt, image_a
     precision_pixel, recall_pixel, thresholds_f1_pixel = precision_recall_curve(pixel_gt, pixel_prediction)
     # For image-level precision-recall curve
     precision, recall, thresholds_f1 = precision_recall_curve(image_gt, image_predictions)
+
+    # Optimal threshold for predicted mask
+    optimal_idx_auc = np.argmin(np.sqrt(np.square(1 - tpr_pixel) + np.square(fpr_pixel)))
+    optimal_threshold_auc = thresholds_pixel[optimal_idx_auc]
+    print(f'optimal auc pixel threshold: {optimal_threshold_auc}')
 
     # Optimal threshold for image f1 calculation
     f1_scores = []
@@ -699,7 +743,7 @@ def save_curves(pixel_prediction, pixel_gt, image_predictions, image_gt, image_a
     print(f"Pixel-level precision-recall curve image saved to '{pr_pixel_path}'.")
     print(f"Image-level precision-recall curve image saved to '{pr_path}'.")
 
-    return optimal_threshold, optimal_threshold_pixel
+    return optimal_threshold, optimal_threshold_pixel, optimal_threshold_auc
 
 def save_loss_graph(train_loss, location):
     plt.figure(figsize=(10, 5))
