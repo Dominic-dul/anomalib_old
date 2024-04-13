@@ -23,6 +23,8 @@ import time
 def get_argparse():
     parser = argparse.ArgumentParser()
     parser.add_argument('-s', '--subdataset', default='bottle')
+    parser.add_argument('-t', '--test_only', default=False)
+    parser.add_argument('-v', '--train_steps', default=100)
     return parser.parse_args()
 
 class ImageNetDataset(Dataset):
@@ -51,7 +53,6 @@ class DefectDataset(Dataset):
     def __init__(self, set='train', get_mask=False, subdataset='bottle'):
         super(DefectDataset, self).__init__()
         self.set = set
-        self.labels = list()
         self.masks = list()
         self.images = list()
         self.class_names = ['good']
@@ -80,7 +81,6 @@ class DefectDataset(Dataset):
                         ('.jpg', '.jpeg', '.png', '.ppm', '.bmp', '.pgm', '.tif', '.tiff', '.webp')):
                     continue
                 self.images.append(i_path)
-                self.labels.append(label)
                 self.defect_classes.append(sc)
 
             if self.get_mask and self.set != 'train' and sc != 'good':
@@ -88,26 +88,22 @@ class DefectDataset(Dataset):
                 self.masks.extend(
                     [os.path.join(mask_dir, p) for p in sorted(os.listdir(mask_dir))])
 
-        self.img_mean = torch.FloatTensor([0.485, 0.456, 0.406])[:, None, None]
-        self.img_std = torch.FloatTensor([0.229, 0.224, 0.225])[:, None, None]
-
     def __len__(self):
         return len(self.images)
 
     def __getitem__(self, index):
-        fg = torch.ones([1, 192, 192])
-
         with open(self.images[index], 'rb') as f:
             img = Image.open(f).convert('RGB')
         img = self.image_transforms(img)
 
-        image_name = os.path.splitext(os.path.basename(self.images[index]))[0]
-        label = self.labels[index]
-
-        ret = [fg, label, img, image_name]
+        ret = [img]
 
         if self.get_mask and self.set != 'train':
-            if label == 0:
+            image_name = os.path.splitext(os.path.basename(self.images[index]))[0]
+            ret.append(image_name)
+
+            defect_class = self.defect_classes[index]
+            if defect_class == 'good':
                 mask = torch.zeros(1, 768, 768)
             else:
                 with open(self.masks[index], 'rb') as f:
@@ -121,7 +117,7 @@ class DefectDataset(Dataset):
                 mask = mask_transforms(mask)
                 mask = (mask > 0.5).float()
             ret.append(mask)
-            ret.append(self.defect_classes[index])
+            ret.append(defect_class)
         return ret
 
 class FeatureExtractor(nn.Module):
@@ -344,6 +340,8 @@ def downsampling(x, size, to_tensor=False, bin=True):
 def main():
     config = get_argparse()
     subdataset = config.subdataset
+    test_only = config.test_only
+    train_steps_config = config.train_steps
 
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
@@ -377,88 +375,90 @@ def main():
     autoencoder.train()
     autoencoder.cuda()
 
-    train_steps = 100
-    patience = 10
-    best_auc = 0
-    epochs_to_improve = 0
-    early_stop = False
-    optimizer = torch.optim.Adam(itertools.chain(student.net.parameters(), autoencoder.net.parameters()), lr=2e-4, eps=1e-08, weight_decay=1e-5)
+    if not test_only:
+        train_steps = train_steps_config
+        patience = 10
+        best_auc = 0
+        epochs_to_improve = 0
+        early_stop = False
+        optimizer = torch.optim.Adam(itertools.chain(student.net.parameters(), autoencoder.net.parameters()), lr=2e-4, eps=1e-08, weight_decay=1e-5)
 
-    # TODO: try reduce on plateau, cos schedulers
-    temp_loss = 150
-    temp_loss_general = 200
-    train_loss = []
-    for sub_epoch in range(train_steps):
-        print('Epoch {} out of {}'.format(sub_epoch+1, train_steps))
-        epoch_loss = 0
-        student.train()
-        autoencoder.train()
-        for (mvtec_data, penalty_data) in zip(tqdm(train_loader, disable=True), penalty_loader):
-            fg, labels, image, _ = mvtec_data
-            penalty_image = penalty_data
-            fg, image, penalty_image = [t.to('cuda') for t in [fg, image, penalty_image]]
+        temp_loss = 150
+        temp_loss_general = 200
+        train_loss = []
+        for sub_epoch in range(train_steps):
+            print('Epoch {} out of {}'.format(sub_epoch+1, train_steps))
+            epoch_loss = 0
+            student.train()
+            autoencoder.train()
+            for (mvtec_data, penalty_data) in zip(tqdm(train_loader, disable=True), penalty_loader):
+                image = mvtec_data
+                image = image[0]
+                image = image.cuda()
+                penalty_image = penalty_data
+                penalty_image = penalty_image.cuda()
 
-            fg_down = downsampling(fg, (24, 24), bin=False)
+                with torch.no_grad():
+                    teacher_output_st, _ = teacher(image)
 
-            with torch.no_grad():
-                teacher_output_st, _ = teacher(image)
+                student_output_st, _ = student(image)
+                student_output_st = student_output_st[:, :304]
 
-            student_output_st, _ = student(image)
-            student_output_st = student_output_st[:, :304]
+                distance_st = (teacher_output_st - student_output_st) ** 2
+                loss_hard = torch.mean(distance_st)
+                # d_hard = torch.quantile(distance_st, q=0.999)
+                # loss_hard = torch.mean(distance_st[distance_st >= d_hard])
 
-            distance_st = (teacher_output_st - student_output_st) ** 2
-            d_hard = torch.quantile(distance_st, q=0.999)
-            loss_hard = torch.mean(distance_st[distance_st >= d_hard])
+                # Imagenet penalty
+                # student_output_penalty, _ = student(penalty_image)
+                # student_output_penalty = student_output_penalty[:, :304]
+                # loss_penalty = torch.mean(student_output_penalty**2)
+                # loss_st = loss_hard + loss_penalty
+                loss_st = loss_hard
 
-            # Imagenet penalty
-            student_output_penalty, _ = student(penalty_image)
-            student_output_penalty = student_output_penalty[:, :304]
-            loss_penalty = torch.mean(student_output_penalty**2)
-            loss_st = loss_hard + loss_penalty
+                ae_output = autoencoder(image)
+                with torch.no_grad():
+                    teacher_output_ae, _ = teacher(image)
+                student_output_ae, _ = student(image)
+                student_output_ae = student_output_ae[:, 304:]
+                distance_ae = (teacher_output_ae - ae_output) ** 2
+                distance_stae = (ae_output - student_output_ae) ** 2
+                loss_ae = torch.mean(distance_ae)
+                loss_stae = torch.mean(distance_stae)
+                loss_total = loss_st + loss_ae + loss_stae
 
-            ae_output = autoencoder(image)
-            with torch.no_grad():
-                teacher_output_ae, _ = teacher(image)
-            student_output_ae, _ = student(image)
-            student_output_ae = student_output_ae[:, 304:]
-            distance_ae = (teacher_output_ae - ae_output) ** 2
-            distance_stae = (ae_output - student_output_ae) ** 2
-            loss_ae = torch.mean(distance_ae)
-            loss_stae = torch.mean(distance_stae)
-            loss_total = loss_st + loss_ae + loss_stae
+                optimizer.zero_grad()
+                loss_total.backward()
+                optimizer.step()
 
-            optimizer.zero_grad()
-            loss_total.backward()
-            optimizer.step()
+                print(f'Loss after epoch: {loss_total.item()}')
+                train_loss.append(loss_total.item())
+                epoch_loss += loss_total.item()
 
-            print(f'Loss after epoch: {loss_total.item()}')
-            train_loss.append(loss_total.item())
-            epoch_loss += loss_total.item()
+            avg_epoch_loss = epoch_loss / len(train_loader)
+            print(f'Average loss after epoch {sub_epoch + 1}: {avg_epoch_loss}')
 
-        avg_epoch_loss = epoch_loss / len(train_loader)
-        print(f'Average loss after epoch {sub_epoch + 1}: {avg_epoch_loss}')
+            student.eval()
+            autoencoder.eval()
+            image_auc, pixel_auc = test(test_loader=test_loader, teacher=teacher, student=student, autoencoder=autoencoder, test_output_dir=test_output_dir, desc='Final inference', calculate_other_metrics=False)
 
-        student.eval()
-        autoencoder.eval()
-        image_auc, pixel_auc = test(test_loader=test_loader, teacher=teacher, student=student, autoencoder=autoencoder, test_output_dir=test_output_dir, desc='Final inference', calculate_other_metrics=False)
+            print(f'Validation pixel AUC after epoch {sub_epoch + 1}: {pixel_auc}')
 
-        print(f'Validation pixel AUC after epoch {sub_epoch + 1}: {pixel_auc}')
+            # Check for early stopping
+            if pixel_auc > best_auc:
+                best_auc = pixel_auc
+                epochs_no_improve = 0
+                # Save best model
+                torch.save(student, join('./models', 'student_' + subdataset + '.pth'))
+                torch.save(autoencoder, join('./models', 'autoencoder_' + subdataset + '.pth'))
+            else:
+                epochs_no_improve += 1
+                if epochs_no_improve == patience:
+                    print('Early stopping!')
+                    early_stop = True
+                    break
 
-        # Check for early stopping
-        if pixel_auc > best_auc:
-            best_auc = pixel_auc
-            epochs_no_improve = 0
-            # Save best model
-            torch.save(student, join('./models', 'student_' + subdataset + '.pth'))
-            torch.save(autoencoder, join('./models', 'autoencoder_' + subdataset + '.pth'))
-        else:
-            epochs_no_improve += 1
-            if epochs_no_improve == patience:
-                print('Early stopping!')
-                early_stop = True
-                break
-
-    save_loss_graph(train_loss, os.path.join(test_output_dir, 'graphs'))
+        save_loss_graph(train_loss, os.path.join(test_output_dir, 'graphs'))
 
     student = torch.load('./models/student_' + subdataset + '.pth')
     student.eval()
@@ -506,13 +506,13 @@ def test(test_loader, teacher, student, autoencoder, test_output_dir=None, desc=
     mask_save_data = []
 
     for data in tqdm(test_loader, desc=desc, disable=True):
-        fg, labels, image, image_name, mask, defect_class = data
+        image, image_name, mask, defect_class = data
         defect_class = defect_class[0]
         _, C, H, W = image.shape
         orig_width = W
         orig_height = H
 
-        fg, image, mask = [t.to('cuda') for t in [fg, image, mask]]
+        image, mask = [t.to('cuda') for t in [image, mask]]
 
         map_combined, map_st, map_ae, latency_ms = predict(image=image, teacher=teacher, student=student, autoencoder=autoencoder)
         map_combined = torch.nn.functional.pad(map_combined, (4, 4, 4, 4))
@@ -563,7 +563,7 @@ def test(test_loader, teacher, student, autoencoder, test_output_dir=None, desc=
         image_f1_threshold, pixel_f1_threshold, optimal_threshold_auc = save_curves(map_flat_combined, mask_flat_combined, y_score, y_true, auc, pixel_roc_auc, os.path.join(test_output_dir, 'graphs'))
 
         # Saving predicted masks as png with the best calculated threshold:
-        save_predicted_masks(mask_save_data, optimal_threshold_auc)
+        save_predicted_masks(mask_save_data, pixel_f1_threshold)
 
         # Convert image and pixel predictions to binary with optimap thresholds
         y_score_binary = (y_score > image_f1_threshold).astype(np.float32)
