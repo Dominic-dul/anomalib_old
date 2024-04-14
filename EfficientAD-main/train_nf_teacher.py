@@ -21,6 +21,7 @@ from scipy.ndimage.morphology import binary_dilation
 from torchvision.datasets import ImageFolder
 from efficientad import StudentTeacherModel, get_nf, FeatureExtractor
 import matplotlib.pyplot as plt
+import time
 
 def get_argparse():
     parser = argparse.ArgumentParser()
@@ -145,6 +146,7 @@ class DefectDataset(Dataset):
         return ret
 
 def train(train_loader, test_loader, subdataset='bottle'):
+    start_time = time.time()
     teacher = StudentTeacherModel(nf=True)
     teacher.cuda()
     optimizer = torch.optim.Adam(teacher.net.parameters(), lr=2e-4, eps=1e-08, weight_decay=1e-5)
@@ -256,6 +258,8 @@ def train(train_loader, test_loader, subdataset='bottle'):
                 break
 
     save_loss_graph(train_loss_full, os.path.join('./output', 'results', subdataset, 'graphs'))
+
+    print(f'Time that it took for training: {time.time() - start_time}')
 
     return teacher, mean_nll_obs, max_nll_obs
 
