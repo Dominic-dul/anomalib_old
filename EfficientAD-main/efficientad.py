@@ -83,10 +83,13 @@ class DefectDataset(Dataset):
                 self.images.append(i_path)
                 self.defect_classes.append(sc)
 
-            if self.get_mask and self.set != 'train' and sc != 'good':
-                mask_dir = os.path.join(root, 'ground_truth', sc)
-                self.masks.extend(
-                    [os.path.join(mask_dir, p) for p in sorted(os.listdir(mask_dir))])
+            if self.get_mask and self.set != 'train':
+                if sc == 'good':
+                    self.masks.extend('mask_is_good' for i in img_paths)
+                else:
+                    mask_dir = os.path.join(root, 'ground_truth', sc)
+                    self.masks.extend(
+                        [os.path.join(mask_dir, p) for p in sorted(os.listdir(mask_dir))])
 
     def __len__(self):
         return len(self.images)
@@ -102,8 +105,7 @@ class DefectDataset(Dataset):
             image_name = os.path.splitext(os.path.basename(self.images[index]))[0]
             ret.append(image_name)
 
-            defect_class = self.defect_classes[index]
-            if defect_class == 'good':
+            if self.masks[index] == 'mask_is_good':
                 mask = torch.zeros(1, 768, 768)
             else:
                 with open(self.masks[index], 'rb') as f:
@@ -117,6 +119,8 @@ class DefectDataset(Dataset):
                 mask = mask_transforms(mask)
                 mask = (mask > 0.5).float()
             ret.append(mask)
+
+            defect_class = self.defect_classes[index]
             ret.append(defect_class)
         return ret
 
