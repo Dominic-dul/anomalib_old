@@ -20,6 +20,7 @@ from os.path import join
 from scipy.ndimage.morphology import binary_dilation
 from torchvision.datasets import ImageFolder
 from efficientad import StudentTeacherModel, get_nf, FeatureExtractor
+import matplotlib.pyplot as plt
 
 def get_argparse():
     parser = argparse.ArgumentParser()
@@ -151,47 +152,53 @@ def train(train_loader, test_loader, subdataset='bottle'):
     mean_nll_obs = Score_Observer('AUROC mean over maps')
     max_nll_obs = Score_Observer('AUROC  max over maps')
 
-    for epoch in range(10):
+    patience = 24
+    best_mean_auc = 0
+    best_max_auc = 0
+    epochs_to_improve = 0
+    early_stop = False
+    train_loss_full = []
+
+    for epoch in range(240):
         teacher.train()
         print(F'\nTrain epoch {epoch}')
-        for sub_epoch in range(24):
-            train_loss = list()
-            for i, data in enumerate(tqdm(train_loader, disable=False)):
-                # Clear gradients.
-                optimizer.zero_grad()
+        train_loss = list()
+        for i, data in enumerate(tqdm(train_loader, disable=True)):
+            # Clear gradients.
+            optimizer.zero_grad()
 
-                # Unpack data and move to device.
-                fg, labels, image = data
-                fg, labels, image = [t.to('cuda') for t in [fg, labels, image]]
+            # Unpack data and move to device.
+            fg, labels, image = data
+            fg, labels, image = [t.to('cuda') for t in [fg, labels, image]]
 
-                # Downsample foreground mask to match the model output size.
-                fg_down = downsampling(fg, (24, 24), bin=False)
-                # Forward pass through the model.
-                z, jac = teacher(image)
+            # Downsample foreground mask to match the model output size.
+            fg_down = downsampling(fg, (24, 24), bin=False)
+            # Forward pass through the model.
+            z, jac = teacher(image)
 
-                # Calculate loss and backpropagate.
-                loss = get_nf_loss(z, jac, fg_down)
-                # Convert tensor loss to numpy and store.
-                train_loss.append(t2np(loss))
+            # Calculate loss and backpropagate.
+            loss = get_nf_loss(z, jac, fg_down)
+            # Convert tensor loss to numpy and store.
+            train_loss.append(t2np(loss))
 
-                # Compute gradients.
-                loss.backward()
-                # Update model parameters.
-                optimizer.step()
+            # Compute gradients.
+            loss.backward()
+            # Update model parameters.
+            optimizer.step()
 
-            # Calculate mean training loss for the epoch.
-            mean_train_loss = np.mean(train_loss)
-            print('Epoch: {:d}.{:d} \t teacher train loss: {:.4f}'.format(epoch, sub_epoch, mean_train_loss))
+        # Calculate mean training loss for the epoch.
+        mean_train_loss = np.mean(train_loss)
+        train_loss_full.append(mean_train_loss)
+        print('Epoch: {:d} \t teacher train loss: {:.4f}'.format(epoch, mean_train_loss))
 
         teacher.eval()
-        print('\nCompute loss and scores on test set:')
         test_loss = list()
         test_labels = list()
         img_nll = list()
         max_nlls = list()
 
         with torch.no_grad():
-            for i, data in enumerate(tqdm(test_loader, disable=False)):
+            for i, data in enumerate(tqdm(test_loader, disable=True)):
                 # Unpack and move data to device, similar to training phase.
                 fg, labels, image = data
                 fg, image = [t.to('cuda') for t in [fg, image]]
@@ -225,12 +232,30 @@ def train(train_loader, test_loader, subdataset='bottle'):
         max_nll_obs.update(roc_auc_score(is_anomaly, max_nlls), epoch,
                            print_score='True' or epoch == 3 - 1)
 
-    if not os.path.exists('./models'):
-        os.makedirs('./models')
-    teacher.to('cpu')
-    torch.save(teacher, join('./models', 'teacher_nf_' + subdataset + '.pth'))
-    print('teacher saved!')
-    teacher.to('cuda')
+        epoch_mean_auc = np.mean(mean_nll_obs.last_score)
+        epoch_max_auc = np.mean(max_nll_obs.last_score)
+
+        if epoch_mean_auc > best_mean_auc or epoch_max_auc > best_max_auc:
+            if epoch_mean_auc > best_mean_auc:
+                best_mean_auc = epoch_mean_auc
+            if epoch_max_auc > best_max_auc:
+                best_max_auc = epoch_max_auc
+            epochs_no_improve = 0
+            # Save best model
+            teacher.to('cpu')
+            if not os.path.exists('./models'):
+                os.makedirs('./models')
+            torch.save(teacher, join('./models', 'teacher_nf_' + subdataset + '.pth'))
+            print('teacher saved!')
+            teacher.to('cuda')
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve == patience:
+                print('Early stopping!')
+                early_stop = True
+                break
+
+    save_loss_graph(train_loss_full, os.path.join('./output', 'results', subdataset, 'graphs'))
 
     return teacher, mean_nll_obs, max_nll_obs
 
@@ -258,6 +283,23 @@ def main_teacher():
     print('best AUROC %\n\tmean over maps: {:.2f} \t max over maps: {:.2f}'.format(best_mean, best_max))
 
     return teacher
+
+def save_loss_graph(train_loss, output_dir):
+    plt.figure(figsize=(10, 5))
+    plt.plot(train_loss, label='Training Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training Loss Over Epochs')
+    plt.legend()
+    plt.grid(True)
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    loss_path = os.path.join(output_dir, 'teacher_training_loss.png')
+    plt.savefig(loss_path)
+    plt.close()
+
+    print(f"Training loss curve image saved to '{loss_path}'.")
 
 if __name__ == '__main__':
     main_teacher()

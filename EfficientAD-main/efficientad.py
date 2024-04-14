@@ -338,6 +338,7 @@ def downsampling(x, size, to_tensor=False, bin=True):
     return down
 
 def main():
+    start_time = time.time()
     config = get_argparse()
     subdataset = config.subdataset
     test_only = config.test_only
@@ -428,11 +429,11 @@ def main():
                 loss_total.backward()
                 optimizer.step()
 
-                print(f'Loss after epoch: {loss_total.item()}')
-                train_loss.append(loss_total.item())
+                # print(f'Loss after iteration: {loss_total.item()}')
                 epoch_loss += loss_total.item()
 
             avg_epoch_loss = epoch_loss / len(train_loader)
+            train_loss.append(avg_epoch_loss)
             print(f'Average loss after epoch {sub_epoch + 1}: {avg_epoch_loss}')
 
             student.eval()
@@ -457,6 +458,7 @@ def main():
 
         save_loss_graph(train_loss, os.path.join(test_output_dir, 'graphs'))
 
+    print(f'Time that it took for training: {time.time() - start_time}')
     student = torch.load('./models/student_' + subdataset + '.pth')
     student.eval()
     student.cuda()
@@ -696,15 +698,15 @@ def save_curves(pixel_prediction, pixel_gt, image_predictions, image_gt, image_a
 def save_loss_graph(train_loss, output_dir):
     plt.figure(figsize=(10, 5))
     plt.plot(train_loss, label='Training Loss')
-    plt.xlabel('Iteration')
+    plt.xlabel('Epoch')
     plt.ylabel('Loss')
-    plt.title('Training Loss Over Iterations')
+    plt.title('Training Loss Over Epochs')
     plt.legend()
     plt.grid(True)
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    loss_path = os.path.join(output_dir, 'training_loss.png')
+    loss_path = os.path.join(output_dir, 'efficientad_training_loss.png')
     plt.savefig(loss_path)
     plt.close()
 
