@@ -463,11 +463,11 @@ def main():
                 # Save best model
                 torch.save(student, join('./models', 'student_' + subdataset + '.pth'))
                 torch.save(autoencoder, join('./models', 'autoencoder_' + subdataset + '.pth'))
+                final_training_epoch = sub_epoch + 1
+                last_loss = avg_epoch_loss
             else:
                 epochs_no_improve += 1
                 if epochs_no_improve == patience:
-                    final_training_epoch = sub_epoch + 1
-                    last_loss = avg_epoch_loss
                     print('Early stopping!')
                     early_stop = True
                     break

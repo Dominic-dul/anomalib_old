@@ -254,11 +254,11 @@ def train(train_loader, test_loader, subdataset='bottle'):
             torch.save(teacher, join('./models', 'teacher_nf_' + subdataset + '.pth'))
             print('teacher saved!')
             teacher.to('cuda')
+            last_loss = mean_train_loss
+            final_training_epoch = epoch
         else:
             epochs_no_improve += 1
             if epochs_no_improve == patience:
-                last_loss = mean_train_loss
-                final_training_epoch = epoch
                 print('Early stopping!')
                 early_stop = True
                 break
