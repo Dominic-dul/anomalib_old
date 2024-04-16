@@ -161,6 +161,10 @@ def train(train_loader, test_loader, subdataset='bottle'):
     early_stop = False
     train_loss_full = []
 
+    first_loss = None
+    last_loss = None
+    final_training_epoch = None
+
     for epoch in range(240):
         teacher.train()
         print(F'\nTrain epoch {epoch}')
@@ -253,13 +257,30 @@ def train(train_loader, test_loader, subdataset='bottle'):
         else:
             epochs_no_improve += 1
             if epochs_no_improve == patience:
+                last_loss = mean_train_loss
+                final_training_epoch = epoch
                 print('Early stopping!')
                 early_stop = True
                 break
 
+        if epoch == 0:
+            first_loss = mean_train_loss
+
+    if not early_stop:
+        last_loss = train_loss_full[-1]
+        final_training_epoch = 240
+
     save_loss_graph(train_loss_full, os.path.join('./output', 'results', subdataset, 'graphs'))
 
-    print(f'Time that it took for training: {time.time() - start_time}')
+    train_time = time.time() - start_time
+
+    with open(os.path.join('./output', 'results', subdataset, 'teacher_metrics.txt'), 'w') as file:
+        file.write('Final auc mean: {:.4f}\n'.format(best_mean_auc))
+        file.write('Final auc max: {:.4f}\n'.format(best_max_auc))
+        file.write('Early stop: ' + str(early_stop))
+        file.write('\nLoss: {:.4f} -> {:.4f}'.format(first_loss, last_loss))
+        file.write('\nTraining time: {:.4f}\n'.format(train_time))
+        file.write('Final training epoch ' + str(final_training_epoch))
 
     return teacher, mean_nll_obs, max_nll_obs
 

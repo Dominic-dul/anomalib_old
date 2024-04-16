@@ -381,9 +381,13 @@ def main():
     autoencoder.cuda()
 
     if test_only == "False":
+        final_training_epoch = None
+        first_loss = None
+        last_loss = None
         train_steps = int(train_steps_config)
         patience = 10
-        best_auc = 0
+        best_pixel_auc = 0
+        best_image_auc = 0
         epochs_to_improve = 0
         early_stop = False
         optimizer = torch.optim.Adam(itertools.chain(student.net.parameters(), autoencoder.net.parameters()), lr=2e-4, eps=1e-08, weight_decay=1e-5)
@@ -437,6 +441,8 @@ def main():
                 epoch_loss += loss_total.item()
 
             avg_epoch_loss = epoch_loss / len(train_loader)
+            if sub_epoch == 0:
+                first_loss = avg_epoch_loss
             train_loss.append(avg_epoch_loss)
             print(f'Average loss after epoch {sub_epoch + 1}: {avg_epoch_loss}')
 
@@ -445,10 +451,14 @@ def main():
             image_auc, pixel_auc = test(test_loader=test_loader, teacher=teacher, student=student, autoencoder=autoencoder, test_output_dir=test_output_dir, desc='Final inference', calculate_other_metrics=False)
 
             print(f'Validation pixel AUC after epoch {sub_epoch + 1}: {pixel_auc}')
+            print(f'Validation image AUC after epoch {sub_epoch + 1}: {image_auc}')
 
             # Check for early stopping
-            if pixel_auc > best_auc:
-                best_auc = pixel_auc
+            if pixel_auc > best_pixel_auc or image_auc > best_image_auc:
+                if pixel_auc > best_pixel_auc:
+                    best_pixel_auc = pixel_auc
+                if image_auc > best_image_auc:
+                    best_image_auc = image_auc
                 epochs_no_improve = 0
                 # Save best model
                 torch.save(student, join('./models', 'student_' + subdataset + '.pth'))
@@ -456,13 +466,20 @@ def main():
             else:
                 epochs_no_improve += 1
                 if epochs_no_improve == patience:
+                    final_training_epoch = sub_epoch + 1
+                    last_loss = avg_epoch_loss
                     print('Early stopping!')
                     early_stop = True
                     break
 
         save_loss_graph(train_loss, os.path.join(test_output_dir, 'graphs'))
 
-    print(f'Time that it took for training: {time.time() - start_time}')
+    if not early_stop:
+        last_loss = train_loss[-1]
+        final_training_epoch = train_steps
+
+    training_time = time.time() - start_time
+    print(f'Time that it took for training: {training_time}')
     student = torch.load('./models/student_' + subdataset + '.pth')
     student.eval()
     student.cuda()
@@ -471,15 +488,31 @@ def main():
     autoencoder.cuda()
 
     auc, pixel_roc_auc, image_f1, pixel_f1, image_recall, image_precision, pixel_recall, pixel_precision, latency = test(test_loader=test_loader, teacher=teacher, student=student, autoencoder=autoencoder, test_output_dir=test_output_dir, desc='Final inference', calculate_other_metrics=True)
-    print('Final pixel auc: {:.4f}'.format(pixel_roc_auc))
-    print('Final image auc: {:.4f}'.format(auc))
-    print('Final pixel f1: {:.4f}'.format(pixel_f1))
-    print('Final image f1: {:.4f}'.format(image_f1))
-    print('Final pixel recall: {:.4f}'.format(pixel_recall))
-    print('Final image recall: {:.4f}'.format(image_recall))
-    print('Final pixel precision: {:.4f}'.format(pixel_precision))
-    print('Final image precision: {:.4f}'.format(image_precision))
-    print('Final average processing latency: {:.4f} ms/img'.format(latency))
+
+    with open(os.path.join('./output', 'results', subdataset, 'efficientad_metrics.txt'), 'w') as file:
+        file.write('Final pixel auc: {:.4f}'.format(pixel_roc_auc))
+        file.write('\nFinal image auc: {:.4f}'.format(auc))
+        file.write('\nFinal pixel f1: {:.4f}'.format(pixel_f1))
+        file.write('\nFinal image f1: {:.4f}'.format(image_f1))
+        file.write('\nFinal pixel recall: {:.4f}'.format(pixel_recall))
+        file.write('\nFinal image recall: {:.4f}'.format(image_recall))
+        file.write('\nFinal pixel precision: {:.4f}'.format(pixel_precision))
+        file.write('\nFinal image precision: {:.4f}'.format(image_precision))
+        file.write('\nFinal average processing latency: {:.4f} ms/img'.format(latency))
+        file.write('\nFinal training time: {:.4f}'.format(training_time))
+        file.write('\nFinal epoch ' + str(final_training_epoch))
+        file.write('\nLoss: {:.4f} -> {:.4f}'.format(first_loss, last_loss))
+
+
+    # print('Final pixel auc: {:.4f}'.format(pixel_roc_auc))
+    # print('Final image auc: {:.4f}'.format(auc))
+    # print('Final pixel f1: {:.4f}'.format(pixel_f1))
+    # print('Final image f1: {:.4f}'.format(image_f1))
+    # print('Final pixel recall: {:.4f}'.format(pixel_recall))
+    # print('Final image recall: {:.4f}'.format(image_recall))
+    # print('Final pixel precision: {:.4f}'.format(pixel_precision))
+    # print('Final image precision: {:.4f}'.format(image_precision))
+    # print('Final average processing latency: {:.4f} ms/img'.format(latency))
 
 @torch.no_grad()
 def predict(image, teacher, student, autoencoder):
