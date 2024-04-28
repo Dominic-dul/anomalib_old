@@ -20,11 +20,21 @@ from os.path import join
 import matplotlib.pyplot as plt
 import time
 
+if torch.cuda.is_available():
+    device = "cuda"
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+else:
+    device = "cpu"
+
 def get_argparse():
     parser = argparse.ArgumentParser()
     parser.add_argument('-s', '--subdataset', default='bottle')
     parser.add_argument('-t', '--test_only', default=False)
     parser.add_argument('-v', '--train_steps', default=100)
+    parser.add_argument('-d', '--dataset_dir', default='mvtec')
+    parser.add_argument('-i', '--imagenet_dir', default='imagenet_pictures/collected_images')
     return parser.parse_args()
 
 class ImageNetDataset(Dataset):
@@ -50,7 +60,7 @@ class ImageNetDataset(Dataset):
         return image
 
 class DefectDataset(Dataset):
-    def __init__(self, set='train', get_mask=False, subdataset='bottle'):
+    def __init__(self, set='train', get_mask=False, subdataset='bottle', dataset_dir='mvtec'):
         super(DefectDataset, self).__init__()
         self.set = set
         self.masks = list()
@@ -59,7 +69,7 @@ class DefectDataset(Dataset):
         self.get_mask = get_mask
         self.defect_classes = []
         self.image_transforms = transforms.Compose([transforms.Resize((768, 768)), transforms.ToTensor(), transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
-        root = join('./mvtec_anomaly_detection/', subdataset)
+        root = join(dataset_dir, subdataset)
         set_dir = os.path.join(root, set)
         subclass = os.listdir(set_dir)
         subclass.sort()
@@ -88,8 +98,13 @@ class DefectDataset(Dataset):
                     self.masks.extend('mask_is_good' for i in img_paths)
                 else:
                     mask_dir = os.path.join(root, 'ground_truth', sc)
-                    self.masks.extend(
+                    if (dataset_dir == 'mvtec_loco_anomaly_detection'):
+                        mask_sub_dirs = [os.path.join(mask_dir, os.path.splitext(p)[0]) for p in img_paths]
+                        self.masks.extend([os.path.join(sub_dir, "000.png") for sub_dir in mask_sub_dirs])
+                    else:
+                        self.masks.extend(
                         [os.path.join(mask_dir, p) for p in sorted(os.listdir(mask_dir))])
+
 
     def __len__(self):
         return len(self.images)
@@ -257,7 +272,7 @@ def positionalencoding2d(D, H, W):
     P[D::2, :, :] = torch.sin(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, W)
     P[D + 1::2, :, :] = torch.cos(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, W)
     # Returns the positional encoding.
-    return P.to('cuda')[None]
+    return P.to(device)[None]
 
 def get_autoencoder(out_channels=304):
     return nn.Sequential(
@@ -335,7 +350,7 @@ class StudentTeacherModel(nn.Module):
 
 def downsampling(x, size, to_tensor=False, bin=True):
     if to_tensor:
-        x = torch.FloatTensor(x).to('cuda')
+        x = torch.FloatTensor(x).to(device)
     down = F.interpolate(x, size=size, mode='bilinear', align_corners=False)
     if bin:
         down[down > 0] = 1
@@ -347,38 +362,32 @@ def main():
     subdataset = config.subdataset
     test_only = config.test_only
     train_steps_config = config.train_steps
+    dataset_dir = config.dataset_dir
+    imagenet_dir = config.imagenet_dir
 
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
-    torch.cuda.manual_seed_all(42)
     np.random.seed(42)
     random.seed(42)
     test_output_dir = os.path.join('output/results', subdataset)
 
-    teacher = torch.load('./models/teacher_nf_' + subdataset + '.pth')
+    teacher = torch.load('./models/teacher_nf_' + subdataset + '.pth', map_location=torch.device(device))
     teacher.eval()
-    teacher.cuda()
+    teacher.to(device)
 
-    full_train_set = DefectDataset(set='train', get_mask=False, subdataset=subdataset)
-    train_size = int(0.9 * len(full_train_set))
-    validation_size = len(full_train_set) - train_size
-    rng = torch.Generator().manual_seed(42)
-    train_set, validation_set = torch.utils.data.random_split(full_train_set, [train_size, validation_size], rng)
-    train_loader = DataLoader(train_set, pin_memory=True, batch_size=8, shuffle=True, drop_last=True)
-    validation_loader = DataLoader(validation_set, pin_memory=True, batch_size=8)
-    test_loader = DataLoader(DefectDataset(set='test', get_mask=True, subdataset=subdataset), pin_memory=True, batch_size=1, shuffle=False, drop_last=False)
+    full_train_set = DefectDataset(set='train', get_mask=False, subdataset=subdataset, dataset_dir=dataset_dir)
+    train_size = int(len(full_train_set))
+    train_loader = DataLoader(full_train_set, pin_memory=True, batch_size=8, shuffle=True, drop_last=True)
+    test_loader = DataLoader(DefectDataset(set='test', get_mask=True, subdataset=subdataset, dataset_dir=dataset_dir), pin_memory=True, batch_size=1, shuffle=False, drop_last=False)
 
-    imagenet_path = './imagenet_pictures/collected_images'
-    penalty_set = ImageNetDataset(imagenet_path, sample_size=train_size)
+    penalty_set = ImageNetDataset(imagenet_dir, sample_size=train_size)
     penalty_loader = DataLoader(penalty_set, pin_memory=True, batch_size=8, shuffle=True, drop_last=True)
 
     student = StudentTeacherModel(nf=False, channels_hidden=1024, n_blocks=4)
     student.train()
-    student.cuda()
+    student.to(device)
 
     autoencoder = StudentTeacherModel(model_autoencoder=True)
     autoencoder.train()
-    autoencoder.cuda()
+    autoencoder.to(device)
 
     if test_only == "False":
         final_training_epoch = None
@@ -388,12 +397,9 @@ def main():
         patience = 10
         best_pixel_auc = 0
         best_image_auc = 0
-        epochs_to_improve = 0
         early_stop = False
         optimizer = torch.optim.Adam(itertools.chain(student.net.parameters(), autoencoder.net.parameters()), lr=2e-4, eps=1e-08, weight_decay=1e-5)
 
-        temp_loss = 150
-        temp_loss_general = 200
         train_loss = []
         for sub_epoch in range(train_steps):
             print('Epoch {} out of {}'.format(sub_epoch+1, train_steps))
@@ -403,17 +409,18 @@ def main():
             for (mvtec_data, penalty_data) in zip(tqdm(train_loader, disable=True), penalty_loader):
                 image = mvtec_data
                 image = image[0]
-                image = image.cuda()
+                image = image.to(device)
                 penalty_image = penalty_data
-                penalty_image = penalty_image.cuda()
+                penalty_image = penalty_image.to(device)
 
                 with torch.no_grad():
-                    teacher_output_st, _ = teacher(image)
+                    teacher_output, _ = teacher(image)
 
-                student_output_st, _ = student(image)
-                student_output_st = student_output_st[:, :304]
+                student_output, _ = student(image)
+                student_output_st = student_output[:, :304]
 
-                distance_st = (teacher_output_st - student_output_st) ** 2
+                # Compare with teacher output
+                distance_st = (teacher_output - student_output_st) ** 2
                 loss_hard = torch.mean(distance_st)
 
                 # Imagenet penalty
@@ -422,12 +429,10 @@ def main():
                 loss_penalty = torch.mean(student_output_penalty**2)
                 loss_st = loss_hard + loss_penalty
 
+                # Compare with ae output
                 ae_output = autoencoder(image)
-                with torch.no_grad():
-                    teacher_output_ae, _ = teacher(image)
-                student_output_ae, _ = student(image)
-                student_output_ae = student_output_ae[:, 304:]
-                distance_ae = (teacher_output_ae - ae_output) ** 2
+                student_output_ae = student_output[:, 304:]
+                distance_ae = (teacher_output - ae_output) ** 2
                 distance_stae = (ae_output - student_output_ae) ** 2
                 loss_ae = torch.mean(distance_ae)
                 loss_stae = torch.mean(distance_stae)
@@ -437,7 +442,6 @@ def main():
                 loss_total.backward()
                 optimizer.step()
 
-                # print(f'Loss after iteration: {loss_total.item()}')
                 epoch_loss += loss_total.item()
 
             avg_epoch_loss = epoch_loss / len(train_loader)
@@ -474,18 +478,19 @@ def main():
 
         save_loss_graph(train_loss, os.path.join(test_output_dir, 'graphs'))
 
-    if not early_stop:
-        last_loss = train_loss[-1]
-        final_training_epoch = train_steps
+        if not early_stop:
+            last_loss = train_loss[-1]
+            final_training_epoch = train_steps
 
-    training_time = time.time() - start_time
-    print(f'Time that it took for training: {training_time}')
-    student = torch.load('./models/student_' + subdataset + '.pth')
+        training_time = time.time() - start_time
+        print(f'Time that it took for training: {training_time}')
+
+    student = torch.load('./models/student_' + subdataset + '.pth', map_location=torch.device(device))
     student.eval()
-    student.cuda()
-    autoencoder = torch.load('./models/autoencoder_' + subdataset + '.pth')
+    student.to(device)
+    autoencoder = torch.load('./models/autoencoder_' + subdataset + '.pth', map_location=torch.device(device))
     autoencoder.eval()
-    autoencoder.cuda()
+    autoencoder.to(device)
 
     auc, pixel_roc_auc, image_f1, pixel_f1, image_recall, image_precision, pixel_recall, pixel_precision, latency = test(test_loader=test_loader, teacher=teacher, student=student, autoencoder=autoencoder, test_output_dir=test_output_dir, desc='Final inference', calculate_other_metrics=True)
 
@@ -499,20 +504,10 @@ def main():
         file.write('\nFinal pixel precision: {:.4f}'.format(pixel_precision))
         file.write('\nFinal image precision: {:.4f}'.format(image_precision))
         file.write('\nFinal average processing latency: {:.4f} ms/img'.format(latency))
-        file.write('\nFinal training time: {:.4f}'.format(training_time))
-        file.write('\nFinal epoch ' + str(final_training_epoch))
-        file.write('\nLoss: {:.4f} -> {:.4f}'.format(first_loss, last_loss))
-
-
-    # print('Final pixel auc: {:.4f}'.format(pixel_roc_auc))
-    # print('Final image auc: {:.4f}'.format(auc))
-    # print('Final pixel f1: {:.4f}'.format(pixel_f1))
-    # print('Final image f1: {:.4f}'.format(image_f1))
-    # print('Final pixel recall: {:.4f}'.format(pixel_recall))
-    # print('Final image recall: {:.4f}'.format(image_recall))
-    # print('Final pixel precision: {:.4f}'.format(pixel_precision))
-    # print('Final image precision: {:.4f}'.format(image_precision))
-    # print('Final average processing latency: {:.4f} ms/img'.format(latency))
+        if test_only == "False":
+            file.write('\nFinal training time: {:.4f}'.format(training_time))
+            file.write('\nFinal epoch ' + str(final_training_epoch))
+            file.write('\nLoss: {:.4f} -> {:.4f}'.format(first_loss, last_loss))
 
 @torch.no_grad()
 def predict(image, teacher, student, autoencoder):
@@ -535,7 +530,6 @@ def predict(image, teacher, student, autoencoder):
 def test(test_loader, teacher, student, autoencoder, test_output_dir=None, desc='Running inference', calculate_other_metrics=False):
     y_true = []
     y_score = []
-    y_score_binary = []
     mask_flat_combined = []
     map_flat_combined = []
     latencies = []
@@ -548,7 +542,7 @@ def test(test_loader, teacher, student, autoencoder, test_output_dir=None, desc=
         orig_width = W
         orig_height = H
 
-        image, mask = [t.to('cuda') for t in [image, mask]]
+        image, mask = [t.to(device) for t in [image, mask]]
 
         map_combined, map_st, map_ae, latency_ms = predict(image=image, teacher=teacher, student=student, autoencoder=autoencoder)
         map_combined = torch.nn.functional.interpolate(map_combined, (orig_height, orig_width), mode='bilinear')

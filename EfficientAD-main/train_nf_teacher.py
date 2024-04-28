@@ -23,9 +23,19 @@ from efficientad import StudentTeacherModel, get_nf, FeatureExtractor
 import matplotlib.pyplot as plt
 import time
 
+if torch.cuda.is_available():
+    device = "cuda"
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    torch.cuda.manual_seed_all(42)
+else:
+    device = "cpu"
+
 def get_argparse():
     parser = argparse.ArgumentParser()
     parser.add_argument('-s', '--subdataset', default='bottle')
+    parser.add_argument('-v', '--train_steps', default=240)
+    parser.add_argument('-d', '--dataset_dir', default='mvtec')
     return parser.parse_args()
 
 class Score_Observer:
@@ -55,7 +65,7 @@ class Score_Observer:
 
 def downsampling(x, size, to_tensor=False, bin=True):
     if to_tensor:
-        x = torch.FloatTensor(x).to('cuda')
+        x = torch.FloatTensor(x).to(device)
     down = F.interpolate(x, size=size, mode='bilinear', align_corners=False)
     if bin:
         down[down > 0] = 1
@@ -76,7 +86,7 @@ def get_nf_loss(z, jac, mask=None, per_sample=False, per_pixel=False):
     return loss_per_sample.mean()
 
 class DefectDataset(Dataset):
-    def __init__(self, set='train', get_mask=True, subdataset='bottle'):
+    def __init__(self, set='train', get_mask=True, subdataset='bottle', dataset_dir='mvtec'):
         super(DefectDataset, self).__init__()
         self.set = set
         self.labels = list()
@@ -86,7 +96,7 @@ class DefectDataset(Dataset):
         self.get_mask = get_mask
         self.image_transforms = transforms.Compose([transforms.Resize((768, 768)), transforms.ToTensor(),
                                                     transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
-        root = join('./mvtec_anomaly_detection/', subdataset)
+        root = join(dataset_dir, subdataset)
         set_dir = os.path.join(root, set)
         subclass = os.listdir(set_dir)
         subclass.sort()
@@ -117,22 +127,6 @@ class DefectDataset(Dataset):
     def __len__(self):
         return len(self.images)
 
-    def transform(self, x, img_len, binary=False):
-        x = x.copy()
-        x = torch.FloatTensor(x)
-        if len(x.shape) == 2:
-            x = x[None, None]
-            channels = 1
-        elif len(x.shape) == 3:
-            x = x.permute(2, 0, 1)[None]
-            channels = x.shape[1]
-        else:
-            raise Exception(f'invalid dimensions of x:{x.shape}')
-
-        x = downsampling(x, (img_len, img_len), bin=binary)
-        x = x.reshape(channels, img_len, img_len)
-        return x
-
     def __getitem__(self, index):
         fg = torch.ones([1, 192, 192])
 
@@ -145,10 +139,10 @@ class DefectDataset(Dataset):
         ret = [fg, label, img]
         return ret
 
-def train(train_loader, test_loader, subdataset='bottle'):
+def train(train_loader, test_loader, subdataset='bottle', train_steps=240):
     start_time = time.time()
     teacher = StudentTeacherModel(nf=True)
-    teacher.cuda()
+    teacher.to(device)
     optimizer = torch.optim.Adam(teacher.net.parameters(), lr=2e-4, eps=1e-08, weight_decay=1e-5)
     # Observers to track AUROC scores during training.
     mean_nll_obs = Score_Observer('AUROC mean over maps')
@@ -157,7 +151,6 @@ def train(train_loader, test_loader, subdataset='bottle'):
     patience = 24
     best_mean_auc = 0
     best_max_auc = 0
-    epochs_to_improve = 0
     early_stop = False
     train_loss_full = []
 
@@ -165,7 +158,7 @@ def train(train_loader, test_loader, subdataset='bottle'):
     last_loss = None
     final_training_epoch = None
 
-    for epoch in range(240):
+    for epoch in range(train_steps):
         teacher.train()
         print(F'\nTrain epoch {epoch}')
         train_loss = list()
@@ -175,7 +168,7 @@ def train(train_loader, test_loader, subdataset='bottle'):
 
             # Unpack data and move to device.
             fg, labels, image = data
-            fg, labels, image = [t.to('cuda') for t in [fg, labels, image]]
+            fg, labels, image = [t.to(device) for t in [fg, labels, image]]
 
             # Downsample foreground mask to match the model output size.
             fg_down = downsampling(fg, (24, 24), bin=False)
@@ -207,7 +200,7 @@ def train(train_loader, test_loader, subdataset='bottle'):
             for i, data in enumerate(tqdm(test_loader, disable=True)):
                 # Unpack and move data to device, similar to training phase.
                 fg, labels, image = data
-                fg, image = [t.to('cuda') for t in [fg, image]]
+                fg, image = [t.to(device) for t in [fg, image]]
 
                 fg_down = downsampling(fg, (24, 24), bin=False)
                 z, jac = teacher(image)
@@ -253,7 +246,7 @@ def train(train_loader, test_loader, subdataset='bottle'):
                 os.makedirs('./models')
             torch.save(teacher, join('./models', 'teacher_nf_' + subdataset + '.pth'))
             print('teacher saved!')
-            teacher.to('cuda')
+            teacher.to(device)
             last_loss = mean_train_loss
             final_training_epoch = epoch
         else:
@@ -268,7 +261,7 @@ def train(train_loader, test_loader, subdataset='bottle'):
 
     if not early_stop:
         last_loss = train_loss_full[-1]
-        final_training_epoch = 240
+        final_training_epoch = train_steps
 
     save_loss_graph(train_loss_full, os.path.join('./output', 'results', subdataset, 'graphs'))
 
@@ -287,16 +280,20 @@ def train(train_loader, test_loader, subdataset='bottle'):
 def main_teacher():
     config = get_argparse()
     subdataset = config.subdataset
+    train_steps_config = config.train_steps
+    dataset_dir = config.dataset_dir
+
+    train_steps = int(train_steps_config)
 
     max_scores = list()
     mean_scores = list()
 
     print('\nTrain class ' + subdataset)
-    train_loader = DataLoader(DefectDataset(set='train', get_mask=False, subdataset=subdataset), pin_memory=True,
+    train_loader = DataLoader(DefectDataset(set='train', get_mask=False, subdataset=subdataset, dataset_dir=dataset_dir), pin_memory=True,
                               batch_size=8, shuffle=True, drop_last=True)
-    test_loader = DataLoader(DefectDataset(set='test', get_mask=False, subdataset=subdataset), pin_memory=True,
+    test_loader = DataLoader(DefectDataset(set='test', get_mask=False, subdataset=subdataset, dataset_dir=dataset_dir), pin_memory=True,
                              batch_size=16, shuffle=False, drop_last=False)
-    teacher, mean_sc, max_sc = train(train_loader, test_loader, subdataset)
+    teacher, mean_sc, max_sc = train(train_loader, test_loader, subdataset, train_steps)
     mean_scores.append(mean_sc)
     max_scores.append(max_sc)
 
