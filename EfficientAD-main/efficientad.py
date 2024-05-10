@@ -103,7 +103,7 @@ class DefectDataset(Dataset):
                         self.masks.extend([os.path.join(sub_dir, "000.png") for sub_dir in mask_sub_dirs])
                     else:
                         self.masks.extend(
-                        [os.path.join(mask_dir, p) for p in sorted(os.listdir(mask_dir))])
+                        [os.path.join(mask_dir, p) for p in sorted(os.listdir(mask_dir)) if p.lower().endswith(('.jpg', '.jpeg', '.png', '.ppm', '.bmp', '.pgm', '.tif', '.tiff', '.webp'))])
 
 
     def __len__(self):
@@ -329,10 +329,13 @@ class StudentTeacherModel(nn.Module):
 
         self.pos_enc = positionalencoding2d(32, 24, 24)
 
-    def forward(self, x):
+    def forward(self, x, extract_features=True):
         # Feature extraction
-        with torch.no_grad():
-            inp = self.feature_extractor(x)
+        if extract_features:
+            with torch.no_grad():
+                inp = self.feature_extractor(x)
+        else:
+            inp = x
 
         # Processing through the network with positional encoding.
         cond = self.pos_enc.tile(inp.shape[0], 1, 1, 1)
@@ -547,7 +550,7 @@ def test(test_loader, teacher, student, autoencoder, test_output_dir=None, desc=
         map_combined, map_st, map_ae, latency_ms = predict(image=image, teacher=teacher, student=student, autoencoder=autoencoder)
         map_combined = torch.nn.functional.interpolate(map_combined, (orig_height, orig_width), mode='bilinear')
         map_combined = map_combined[0, 0].cpu().numpy()
-        map_combined = 1 / (1 + np.exp(-map_combined))
+        # map_combined = 1 / (1 + np.exp(-map_combined))
 
         latencies.append(latency_ms)
 

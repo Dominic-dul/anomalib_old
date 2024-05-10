@@ -1,27 +1,21 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
-import numpy as np
-import tifffile
-import torch
-from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms, datasets
 import argparse
-import itertools
 import os
-import random
-from tqdm import tqdm
-from sklearn.metrics import roc_auc_score
-from efficientnet_pytorch import EfficientNet
-import torch.nn.functional as F
-from freia_funcs import *
-import torch.nn as nn
-from PIL import Image
-from os.path import join
-from scipy.ndimage.morphology import binary_dilation
-from torchvision.datasets import ImageFolder
-from efficientad import StudentTeacherModel, get_nf, FeatureExtractor
-import matplotlib.pyplot as plt
 import time
+from os.path import join
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn.functional as F
+from PIL import Image
+from sklearn.metrics import roc_auc_score
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+from tqdm import tqdm
+
+from efficientad import StudentTeacherModel
 
 if torch.cuda.is_available():
     device = "cuda"
@@ -120,7 +114,7 @@ class DefectDataset(Dataset):
                 self.images.append(i_path)
                 self.labels.append(label)
 
-
+        self.features = np.load(os.path.join('data', 'features', subdataset, set + '.npy'))
         self.img_mean = torch.FloatTensor([0.485, 0.456, 0.406])[:, None, None]
         self.img_std = torch.FloatTensor([0.229, 0.224, 0.225])[:, None, None]
 
@@ -135,8 +129,9 @@ class DefectDataset(Dataset):
         img = self.image_transforms(img)
 
         label = self.labels[index]
+        feat = self.features[index]
 
-        ret = [fg, label, img]
+        ret = [fg, label, img, feat]
         return ret
 
 def train(train_loader, test_loader, subdataset='bottle', train_steps=240):
@@ -148,15 +143,8 @@ def train(train_loader, test_loader, subdataset='bottle', train_steps=240):
     mean_nll_obs = Score_Observer('AUROC mean over maps')
     max_nll_obs = Score_Observer('AUROC  max over maps')
 
-    patience = 24
-    best_mean_auc = 0
-    best_max_auc = 0
-    early_stop = False
     train_loss_full = []
-
     first_loss = None
-    last_loss = None
-    final_training_epoch = None
 
     for epoch in range(train_steps):
         teacher.train()
@@ -167,13 +155,13 @@ def train(train_loader, test_loader, subdataset='bottle', train_steps=240):
             optimizer.zero_grad()
 
             # Unpack data and move to device.
-            fg, labels, image = data
-            fg, labels, image = [t.to(device) for t in [fg, labels, image]]
+            fg, labels, image, features = data
+            fg, labels, image, features = [t.to(device) for t in [fg, labels, image, features]]
 
             # Downsample foreground mask to match the model output size.
             fg_down = downsampling(fg, (24, 24), bin=False)
             # Forward pass through the model.
-            z, jac = teacher(image)
+            z, jac = teacher(features, extract_features=False)
 
             # Calculate loss and backpropagate.
             loss = get_nf_loss(z, jac, fg_down)
@@ -190,90 +178,66 @@ def train(train_loader, test_loader, subdataset='bottle', train_steps=240):
         train_loss_full.append(mean_train_loss)
         print('Epoch: {:d} \t teacher train loss: {:.4f}'.format(epoch, mean_train_loss))
 
-        teacher.eval()
-        test_loss = list()
-        test_labels = list()
-        img_nll = list()
-        max_nlls = list()
+        if epoch % 24 == 0:
+            teacher.eval()
+            test_loss = list()
+            test_labels = list()
+            img_nll = list()
+            max_nlls = list()
 
-        with torch.no_grad():
-            for i, data in enumerate(tqdm(test_loader, disable=True)):
-                # Unpack and move data to device, similar to training phase.
-                fg, labels, image = data
-                fg, image = [t.to(device) for t in [fg, image]]
+            with torch.no_grad():
+                for i, data in enumerate(tqdm(test_loader, disable=True)):
+                    # Unpack and move data to device, similar to training phase.
+                    fg, labels, image, features = data
+                    fg, image, features = [t.to(device) for t in [fg, image, features]]
 
-                fg_down = downsampling(fg, (24, 24), bin=False)
-                z, jac = teacher(image)
-                # Calculate loss for each sample.
-                loss = get_nf_loss(z, jac, fg_down, per_sample=True)
-                # Calculate per-pixel loss.
-                nll = get_nf_loss(z, jac, fg_down, per_pixel=True)
+                    fg_down = downsampling(fg, (24, 24), bin=False)
+                    z, jac = teacher(features, extract_features=False)
+                    # Calculate loss for each sample.
+                    loss = get_nf_loss(z, jac, fg_down, per_sample=True)
+                    # Calculate per-pixel loss.
+                    nll = get_nf_loss(z, jac, fg_down, per_pixel=True)
 
-                img_nll.append(t2np(loss))
-                # Track max loss over all pixels.
-                max_nlls.append(np.max(t2np(nll), axis=(-1, -2)))
-                # Calculate mean test loss.
-                test_loss.append(loss.mean().item())
-                test_labels.append(labels)
+                    img_nll.append(t2np(loss))
+                    # Track max loss over all pixels.
+                    max_nlls.append(np.max(t2np(nll), axis=(-1, -2)))
+                    # Calculate mean test loss.
+                    test_loss.append(loss.mean().item())
+                    test_labels.append(labels)
 
-        img_nll = np.concatenate(img_nll)
-        max_nlls = np.concatenate(max_nlls)
-        test_loss = np.mean(np.array(test_loss))
+            img_nll = np.concatenate(img_nll)
+            max_nlls = np.concatenate(max_nlls)
+            test_loss = np.mean(np.array(test_loss))
 
-        print('Epoch: {:d} \t teacher test_loss: {:.4f}'.format(epoch, test_loss))
+            print('Epoch: {:d} \t teacher test_loss: {:.4f}'.format(epoch, test_loss))
 
-        test_labels = np.concatenate(test_labels)
-        # Prepare anomaly labels.
-        is_anomaly = np.array([0 if l == 0 else 1 for l in test_labels])
+            test_labels = np.concatenate(test_labels)
+            # Prepare anomaly labels.
+            is_anomaly = np.array([0 if l == 0 else 1 for l in test_labels])
 
-        mean_nll_obs.update(roc_auc_score(is_anomaly, img_nll), epoch,
-                            print_score='True' or epoch == 3 - 1)
-        max_nll_obs.update(roc_auc_score(is_anomaly, max_nlls), epoch,
-                           print_score='True' or epoch == 3 - 1)
-
-        epoch_mean_auc = np.mean(mean_nll_obs.last_score)
-        epoch_max_auc = np.mean(max_nll_obs.last_score)
-
-        if epoch_mean_auc > best_mean_auc or epoch_max_auc > best_max_auc:
-            if epoch_mean_auc > best_mean_auc:
-                best_mean_auc = epoch_mean_auc
-            if epoch_max_auc > best_max_auc:
-                best_max_auc = epoch_max_auc
-            epochs_no_improve = 0
-            # Save best model
-            teacher.to('cpu')
-            if not os.path.exists('./models'):
-                os.makedirs('./models')
-            torch.save(teacher, join('./models', 'teacher_nf_' + subdataset + '.pth'))
-            print('teacher saved!')
-            teacher.to(device)
-            last_loss = mean_train_loss
-            final_training_epoch = epoch
-        else:
-            epochs_no_improve += 1
-            if epochs_no_improve == patience:
-                print('Early stopping!')
-                early_stop = True
-                break
-
+            mean_nll_obs.update(roc_auc_score(is_anomaly, img_nll), epoch,
+                                print_score='True' or epoch == 3 - 1)
+            max_nll_obs.update(roc_auc_score(is_anomaly, max_nlls), epoch,
+                               print_score='True' or epoch == 3 - 1)
         if epoch == 0:
             first_loss = mean_train_loss
 
-    if not early_stop:
-        last_loss = train_loss_full[-1]
-        final_training_epoch = train_steps
-
+    last_loss = train_loss_full[-1]
     save_loss_graph(train_loss_full, os.path.join('./output', 'results', subdataset, 'graphs'))
-
     train_time = time.time() - start_time
 
+    teacher.to('cpu')
+    if not os.path.exists('./models'):
+        os.makedirs('./models')
+    torch.save(teacher, join('./models', 'teacher_nf_' + subdataset + '.pth'))
+    print('teacher saved!')
+    teacher.to(device)
+
     with open(os.path.join('./output', 'results', subdataset, 'teacher_metrics.txt'), 'w') as file:
-        file.write('Final auc mean: {:.4f}\n'.format(best_mean_auc))
-        file.write('Final auc max: {:.4f}\n'.format(best_max_auc))
-        file.write('Early stop: ' + str(early_stop))
+        file.write('Final auc mean: {:.4f}\n'.format(np.mean(mean_nll_obs.last_score)))
+        file.write('Final auc max: {:.4f}\n'.format(np.mean(max_nll_obs.last_score)))
         file.write('\nLoss: {:.4f} -> {:.4f}'.format(first_loss, last_loss))
         file.write('\nTraining time: {:.4f}\n'.format(train_time))
-        file.write('Final training epoch ' + str(final_training_epoch))
 
     return teacher, mean_nll_obs, max_nll_obs
 
