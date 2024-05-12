@@ -1,24 +1,21 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
-import numpy as np
-import tifffile
-import torch
-from torch.utils.data import DataLoader, Dataset
-from torchvision import transforms, datasets
 import argparse
 import itertools
-import os
 import random
-from tqdm import tqdm
-from sklearn.metrics import roc_auc_score, roc_curve, precision_recall_curve, f1_score, precision_score, recall_score
-from efficientnet_pytorch import EfficientNet
-import torch.nn.functional as F
-from freia_funcs import *
-import torch.nn as nn
-from PIL import Image
-from os.path import join
-import matplotlib.pyplot as plt
 import time
+from os.path import join
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+from PIL import Image
+from sklearn.metrics import roc_auc_score, f1_score, precision_score, recall_score
+from torch.utils.data import DataLoader, Dataset
+from torchvision import transforms
+from tqdm import tqdm
+
+from utils import *
 
 if torch.cuda.is_available():
     device = "cuda"
@@ -28,12 +25,14 @@ if torch.cuda.is_available():
 else:
     device = "cpu"
 
+random.seed(42)
+
 def get_argparse():
     parser = argparse.ArgumentParser()
     parser.add_argument('-s', '--subdataset', default='bottle')
     parser.add_argument('-t', '--test_only', default=False)
     parser.add_argument('-v', '--train_steps', default=100)
-    parser.add_argument('-d', '--dataset_dir', default='mvtec')
+    parser.add_argument('-d', '--dataset_dir', default='mvtec_anomaly_detection')
     parser.add_argument('-i', '--imagenet_dir', default='imagenet_pictures/collected_images')
     return parser.parse_args()
 
@@ -139,237 +138,15 @@ class DefectDataset(Dataset):
             ret.append(defect_class)
         return ret
 
-class FeatureExtractor(nn.Module):
-    def __init__(self, layer_idx=35):
-        super(FeatureExtractor, self).__init__()
-        self.feature_extractor = EfficientNet.from_pretrained('efficientnet-b5')
-        # Index of the layer to extract features from.
-        self.layer_idx = layer_idx
-
-    # Processing through EfficientNet up to specified layer.
-    def forward(self, x):
-        x = self.feature_extractor._swish(self.feature_extractor._bn0(self.feature_extractor._conv_stem(x)))
-        for idx, block in enumerate(self.feature_extractor._blocks):
-            drop_connect_rate = self.feature_extractor._global_params.drop_connect_rate
-            if drop_connect_rate:
-                drop_connect_rate *= float(idx) / len(self.feature_extractor._blocks)  # scale drop connect_rate
-            x = block(x, drop_connect_rate=drop_connect_rate)
-            if idx == self.layer_idx:
-                # Returning features from the specified layer.
-                return x
-
-# Function to create a normalizing flow model for the teacher.
-def get_nf(input_dim=304, channels_hidden=1024):
-    nodes = list()
-    # Main input node.
-    nodes.append(InputNode(32, name='input'))
-    nodes.append(InputNode(input_dim, name='input'))
-    kernel_sizes = [3, 3, 3, 5]
-    # Creating coupling blocks.
-    for k in range(4):
-        nodes.append(Node([nodes[-1].out0], permute_layer, {'seed': k}, name=F'permute_{k}'))
-        # Conditional coupling layer if positional encoding is used.
-        nodes.append(Node([nodes[-1].out0, nodes[0].out0], glow_coupling_layer_cond,
-                          {'clamp': 3.0,
-                           'F_class': F_conv,
-                           'cond_dim': 32,
-                           'F_args': {'channels_hidden': channels_hidden,
-                                      'kernel_size': kernel_sizes[k]}},
-                          name=F'conv_{k}'))
-    # Output node
-    nodes.append(OutputNode([nodes[-1].out0], name='output'))
-    # Creating the reversible graph net.
-    nf = ReversibleGraphNet(nodes, n_jac=1)
-    return nf
-
-class res_block(nn.Module):
-    def __init__(self, channels):
-        super(res_block, self).__init__()
-        # First convolution layer to process the input tensor
-        self.l1 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        # Second convolution layer for further processing
-        self.l2 = nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        # Activation function to introduce non-linearity
-        self.act = nn.LeakyReLU()
-        # Batch normalization to stabilize and speed up training
-        self.bn1 = nn.BatchNorm2d(channels)
-        # Second batch normalization for the second convolution layer
-        self.bn2 = nn.BatchNorm2d(channels)
-
-    def forward(self, x):
-        # Store the original input for the residual connection
-        inp = x
-        # First layer processing
-        x = self.l1(x)
-        x = self.bn1(x)
-        x = self.act(x)
-
-        # Second layer processing
-        x = self.l2(x)
-        x = self.bn2(x)
-        x = self.act(x)
-        # Adding the input back to the output (residual connection)
-        x = x + inp
-        return x
-
-# The student model consisting of convolutional layers and residual blocks.
-class Student(nn.Module):
-    def __init__(self, channels_hidden=1024, n_blocks=4):
-        super(Student, self).__init__()
-        # Calculate input features, adjust for positional encoding if used
-        inp_feat = 336
-        # Initial convolution layer to adapt the input feature size
-        self.conv1 = nn.Conv2d(inp_feat, channels_hidden, kernel_size=3, padding=1)
-        # Final convolution layer to produce the output feature map
-        self.conv2 = nn.Conv2d(channels_hidden, 608, kernel_size=3, padding=1)
-        # Initialize the residual blocks
-        self.res = list()
-        # Initializing residual blocks.
-        for _ in range(n_blocks):
-            self.res.append(res_block(channels_hidden))
-        self.res = nn.ModuleList(self.res)
-        # Learnable scaling parameter for the output
-        self.gamma = nn.Parameter(torch.zeros(1))
-        # Activation function for non-linearity
-        self.act = nn.LeakyReLU()
-
-    def forward(self, x):
-        # Concatenate positional encoding to the input
-        x = torch.cat(x, dim=1)
-        # Process input through the initial convolution layer
-        x = self.act(self.conv1(x))
-        # Pass the output through each residual block
-        for i in range(len(self.res)):
-            x = self.res[i](x)
-
-        # Final convolution to produce the output feature map
-        x = self.conv2(x)
-        return x
-
-    def jacobian(self, run_forward=False):
-        return [0] # Placeholder for Jacobian computation, not applicable for student and autoencoder models.
-
-# Function to create positional encoding.
-def positionalencoding2d(D, H, W):
-    """
-    taken from https://github.com/gudovskiy/cflow-ad
-    :param D: dimension of the model
-    :param H: H of the positions
-    :param W: W of the positions
-    :return: DxHxW position matrix
-    """
-    # Creates a positional encoding matrix.
-    if D % 4 != 0:
-        raise ValueError("Cannot use sin/cos positional encoding with odd dimension (got dim={:d})".format(D))
-    P = torch.zeros(D, H, W)
-    # Each dimension use half of D
-    D = D // 2
-    div_term = torch.exp(torch.arange(0.0, D, 2) * -(np.log(1e4) / D))
-    pos_w = torch.arange(0.0, W).unsqueeze(1)
-    pos_h = torch.arange(0.0, H).unsqueeze(1)
-    P[0:D:2, :, :] = torch.sin(pos_w * div_term).transpose(0, 1).unsqueeze(1).repeat(1, H, 1)
-    P[1:D:2, :, :] = torch.cos(pos_w * div_term).transpose(0, 1).unsqueeze(1).repeat(1, H, 1)
-    P[D::2, :, :] = torch.sin(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, W)
-    P[D + 1::2, :, :] = torch.cos(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, W)
-    # Returns the positional encoding.
-    return P.to(device)[None]
-
-def get_autoencoder(out_channels=304):
-    return nn.Sequential(
-        # encoder
-        nn.Conv2d(in_channels=336, out_channels=32, kernel_size=3, stride=1, padding=1),
-        nn.ReLU(inplace=True),
-        nn.Conv2d(in_channels=32, out_channels=32, kernel_size=3, stride=1, padding=1),
-        nn.ReLU(inplace=True),
-        nn.Conv2d(in_channels=32, out_channels=64, kernel_size=3, stride=1, padding=1),
-        nn.ReLU(inplace=True),
-        nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1),
-        nn.ReLU(inplace=True),
-        nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1),
-        nn.ReLU(inplace=True),
-        nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1),
-        nn.ReLU(inplace=True),
-        # decoder
-        nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1),
-        nn.ReLU(inplace=True),
-        nn.Dropout(0.2),
-        nn.Upsample(scale_factor=2, mode='nearest'),
-        nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1),
-        nn.ReLU(inplace=True),
-        nn.Dropout(0.2),
-        nn.Upsample(scale_factor=2, mode='nearest'),
-        nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1),
-        nn.ReLU(inplace=True),
-        nn.Dropout(0.2),
-        nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1),
-        nn.ReLU(inplace=True),
-        nn.Dropout(0.2),
-        nn.Upsample(scale_factor=2, mode='nearest'),
-        nn.Conv2d(in_channels=64, out_channels=64, kernel_size=3, stride=1, padding=1),
-        nn.ReLU(inplace=True),
-        nn.Dropout(0.2),
-        nn.Conv2d(in_channels=64, out_channels=out_channels, kernel_size=3, stride=1, padding=1),
-        nn.ReLU(inplace=True),
-        nn.Dropout(0.2),
-        nn.AdaptiveAvgPool2d((24, 24))
-    )
-
-class StudentTeacherModel(nn.Module):
-    def __init__(self, nf=False, n_blocks=4, channels_hidden=64, model_autoencoder=False):
-        super(StudentTeacherModel, self).__init__()
-
-        self.feature_extractor = FeatureExtractor()
-        self.model_autoencoder = model_autoencoder
-        if model_autoencoder:
-            self.net = get_autoencoder(304)
-        elif nf:
-            self.net = get_nf()
-        else:
-            self.net = Student(channels_hidden=channels_hidden, n_blocks=n_blocks)
-
-        self.pos_enc = positionalencoding2d(32, 24, 24)
-
-    def forward(self, x, extract_features=True):
-        # Feature extraction
-        if extract_features:
-            with torch.no_grad():
-                inp = self.feature_extractor(x)
-        else:
-            inp = x
-
-        # Processing through the network with positional encoding.
-        cond = self.pos_enc.tile(inp.shape[0], 1, 1, 1)
-
-        if self.model_autoencoder:
-            ae_input = torch.cat([cond, inp], dim=1)
-            return self.net(ae_input)
-        else:
-            # Passing input through the network
-            z = self.net([cond, inp])
-            # Calculating the Jacobian for the normalizing flow.
-            jac = self.net.jacobian(run_forward=False)[0]
-            # Returning the transformed input and Jacobian.
-            return z, jac
-
-def downsampling(x, size, to_tensor=False, bin=True):
-    if to_tensor:
-        x = torch.FloatTensor(x).to(device)
-    down = F.interpolate(x, size=size, mode='bilinear', align_corners=False)
-    if bin:
-        down[down > 0] = 1
-    return down
-
 def main():
     start_time = time.time()
     config = get_argparse()
     subdataset = config.subdataset
     test_only = config.test_only
-    train_steps_config = config.train_steps
+    train_steps = int(config.train_steps)
     dataset_dir = config.dataset_dir
     imagenet_dir = config.imagenet_dir
 
-    np.random.seed(42)
-    random.seed(42)
     test_output_dir = os.path.join('output/results', subdataset)
 
     teacher = torch.load('./models/teacher_nf_' + subdataset + '.pth', map_location=torch.device(device))
@@ -396,7 +173,6 @@ def main():
         final_training_epoch = None
         first_loss = None
         last_loss = None
-        train_steps = int(train_steps_config)
         patience = 10
         best_pixel_auc = 0
         best_image_auc = 0
@@ -467,7 +243,7 @@ def main():
                 if image_auc > best_image_auc:
                     best_image_auc = image_auc
                 epochs_no_improve = 0
-                # Save best model
+
                 torch.save(student, join('./models', 'student_' + subdataset + '.pth'))
                 torch.save(autoencoder, join('./models', 'autoencoder_' + subdataset + '.pth'))
                 final_training_epoch = sub_epoch + 1
@@ -479,7 +255,7 @@ def main():
                     early_stop = True
                     break
 
-        save_loss_graph(train_loss, os.path.join(test_output_dir, 'graphs'))
+        save_loss_graph(train_loss, os.path.join(test_output_dir, 'graphs'), 'efficientad_training_loss.png')
 
         if not early_stop:
             last_loss = train_loss[-1]
@@ -512,24 +288,6 @@ def main():
             file.write('\nFinal epoch ' + str(final_training_epoch))
             file.write('\nLoss: {:.4f} -> {:.4f}'.format(first_loss, last_loss))
 
-@torch.no_grad()
-def predict(image, teacher, student, autoencoder):
-    start_time = time.time()
-    # Generate predictions using the teacher model
-    teacher_output, _ = teacher(image)
-    # Generate predictions using the student model
-    student_output, _ = student(image)
-    # Generate reconstructions using the autoencoder
-    autoencoder_output = autoencoder(image)
-    end_time = time.time()
-    latency_ms = (end_time - start_time) * 1000
-    # Calculate the mean squared error (MSE) between the teacher and student outputs
-    map_st = torch.mean((teacher_output - student_output[:, :304])**2, dim=1, keepdim=True)
-    # Calculate the MSE between the autoencoder output and the student output
-    map_ae = torch.mean((autoencoder_output - student_output[:, 304:])**2, dim=1, keepdim=True)
-    map_combined = 0.5 * map_st + 0.5 * map_ae
-    return map_combined, map_st, map_ae, latency_ms
-
 def test(test_loader, teacher, student, autoencoder, test_output_dir=None, desc='Running inference', calculate_other_metrics=False):
     y_true = []
     y_score = []
@@ -550,7 +308,6 @@ def test(test_loader, teacher, student, autoencoder, test_output_dir=None, desc=
         map_combined, map_st, map_ae, latency_ms = predict(image=image, teacher=teacher, student=student, autoencoder=autoencoder)
         map_combined = torch.nn.functional.interpolate(map_combined, (orig_height, orig_width), mode='bilinear')
         map_combined = map_combined[0, 0].cpu().numpy()
-        # map_combined = 1 / (1 + np.exp(-map_combined))
 
         latencies.append(latency_ms)
 
@@ -583,20 +340,20 @@ def test(test_loader, teacher, student, autoencoder, test_output_dir=None, desc=
         mask_flat_combined.extend(mask_flat)
         map_flat_combined.extend(map_flat)
 
-    # pixel-level auc calculations
+    # pixel-level auroc calculations
     pixel_roc_auc = roc_auc_score(y_true=mask_flat_combined, y_score=map_flat_combined)
     pixel_roc_auc = pixel_roc_auc * 100
-    # image-level auc calculations
+    # image-level auroc calculations
     auc = roc_auc_score(y_true=y_true, y_score=y_score)
     auc = auc * 100
 
     if calculate_other_metrics:
-        image_f1_threshold, pixel_f1_threshold, optimal_threshold_auc = save_curves(map_flat_combined, mask_flat_combined, y_score, y_true, auc, pixel_roc_auc, os.path.join(test_output_dir, 'graphs'))
+        image_f1_threshold, pixel_f1_threshold = save_curves(map_flat_combined, mask_flat_combined, y_score, y_true, auc, pixel_roc_auc, os.path.join(test_output_dir, 'graphs'))
 
         # Saving predicted masks as png with the best calculated threshold:
         save_predicted_masks(mask_save_data, pixel_f1_threshold)
 
-        # Convert image and pixel predictions to binary with optimap thresholds
+        # Convert image and pixel predictions to binary with calculated thresholds
         y_score_binary = (y_score > image_f1_threshold).astype(np.float32)
         map_flat_combined_binary = (map_flat_combined > pixel_f1_threshold).astype(np.float32)
 
@@ -617,134 +374,24 @@ def test(test_loader, teacher, student, autoencoder, test_output_dir=None, desc=
     else:
         return auc, pixel_roc_auc
 
-def save_predicted_masks(save_data, threshold):
-    for directory_path, file_path, mask in save_data:
-        if not os.path.exists(directory_path):
-            os.makedirs(directory_path)
+@torch.no_grad()
+def predict(image, teacher, student, autoencoder):
+    start_time = time.time()
 
-        mask = (mask > threshold).astype(np.float32)
-        image_to_save = Image.fromarray((mask * 255).astype(np.uint8))
-        image_to_save.save(file_path)
+    teacher_output, _ = teacher(image)
+    student_output, _ = student(image)
+    autoencoder_output = autoencoder(image)
 
-def save_curves(pixel_prediction, pixel_gt, image_predictions, image_gt, image_auc, pixel_auc, output_dir):
-    # For pixel-level ROC curve
-    fpr_pixel, tpr_pixel, thresholds_pixel = roc_curve(y_true=pixel_gt, y_score=pixel_prediction)
-    # For image-level ROC curve
-    fpr, tpr, thresholds = roc_curve(y_true=image_gt, y_score=image_predictions)
-    # For pixel-level precision-recall curve
-    precision_pixel, recall_pixel, thresholds_f1_pixel = precision_recall_curve(pixel_gt, pixel_prediction)
-    # For image-level precision-recall curve
-    precision, recall, thresholds_f1 = precision_recall_curve(image_gt, image_predictions)
+    end_time = time.time()
+    latency_ms = (end_time - start_time) * 1000
 
-    # Optimal threshold for predicted mask
-    optimal_idx_auc = np.argmin(np.sqrt(np.square(1 - tpr_pixel) + np.square(fpr_pixel)))
-    optimal_threshold_auc = thresholds_pixel[optimal_idx_auc]
-    print(f'optimal auc pixel threshold: {optimal_threshold_auc}')
-
-    # Optimal threshold for image f1 calculation
-    f1_scores = []
-    for p, r in zip(precision, recall):
-        if (p + r) != 0:
-            f1 = 2 * p * r / (p + r)
-        else:
-            f1 = 0  # Define F1 as 0 if both precision and recall are zero
-        f1_scores.append(f1)
-
-    optimal_idx = np.argmax(f1_scores)
-    optimal_threshold = thresholds_f1[optimal_idx]
-    print(f"optimal image f1 threshold: {optimal_threshold}")
-
-    # Optimal threshold for pixel f1 calculation
-    f1_scores_pixel = []
-    for p, r in zip(precision_pixel, recall_pixel):
-        if (p + r) != 0:
-            f1 = 2 * p * r / (p + r)
-        else:
-            f1 = 0  # Define F1 as 0 if both precision and recall are zero
-        f1_scores_pixel.append(f1)
-
-    optimal_idx_pixel = np.argmax(f1_scores_pixel)
-    optimal_threshold_pixel = thresholds_f1_pixel[optimal_idx_pixel]
-    print(f"optimal pixel f1 threshold: {optimal_threshold_pixel}")
-
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-
-    # Plotting the image-level Precision-Recall curve
-    plt.figure(figsize=(8, 6))
-    plt.plot(recall, precision, label='Precision-Recall Curve', color='navy')
-    plt.xlabel('Recall')
-    plt.ylabel('Precision')
-    plt.title('Precision-Recall Curve Image-Level')
-    plt.legend(loc="best")
-    plt.grid(True)
-    pr_path = os.path.join(output_dir, 'precision_recall_image.png')
-    plt.savefig(pr_path, dpi=300, bbox_inches='tight')
-    plt.close()
-
-    # Plotting the pixel-level Precision-Recall curve
-    plt.figure(figsize=(8, 6))
-    plt.plot(recall_pixel, precision_pixel, label='Precision-Recall Curve', color='navy')
-    plt.xlabel('Recall')
-    plt.ylabel('Precision')
-    plt.title('Precision-Recall Curve Pixel-Level')
-    plt.legend(loc="best")
-    plt.grid(True)
-    pr_pixel_path = os.path.join(output_dir, 'precision_recall_pixel.png')
-    plt.savefig(pr_pixel_path, dpi=300, bbox_inches='tight')
-    plt.close()
-
-    # Plotting and saving the pixel-level ROC curve
-    plt.figure()
-    plt.plot(fpr_pixel, tpr_pixel, color='darkorange', lw=2, label='Pixel ROC curve (area = %0.2f)' % pixel_auc)
-    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-    plt.xlim([0.0, 1.0])
-    plt.ylim([0.0, 1.05])
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title('Pixel-level Receiver Operating Characteristic')
-    plt.legend(loc="lower right")
-    pixel_roc_path = os.path.join(output_dir, 'pixel_roc.png')
-    plt.savefig(pixel_roc_path, dpi=300, bbox_inches='tight')
-    plt.close()
-
-    # Plotting and saving the image-level ROC curve
-    plt.figure()
-    plt.plot(fpr, tpr, color='blue', lw=2, label='Overall ROC curve (area = %0.2f)' % image_auc)
-    plt.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-    plt.xlim([0.0, 1.0])
-    plt.ylim([0.0, 1.05])
-    plt.xlabel('False Positive Rate')
-    plt.ylabel('True Positive Rate')
-    plt.title('Image-level Receiver Operating Characteristic')
-    plt.legend(loc="lower right")
-    image_roc_path = os.path.join(output_dir, 'image_roc.png')
-    plt.savefig(image_roc_path, dpi=300, bbox_inches='tight')
-    plt.close()
-
-    print(f"Pixel-level ROC curve image saved to '{pixel_roc_path}'.")
-    print(f"Image-level ROC curve image saved to '{image_roc_path}'.")
-    print(f"Pixel-level precision-recall curve image saved to '{pr_pixel_path}'.")
-    print(f"Image-level precision-recall curve image saved to '{pr_path}'.")
-
-    return optimal_threshold, optimal_threshold_pixel, optimal_threshold_auc
-
-def save_loss_graph(train_loss, output_dir):
-    plt.figure(figsize=(10, 5))
-    plt.plot(train_loss, label='Training Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Training Loss Over Epochs')
-    plt.legend()
-    plt.grid(True)
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
-
-    loss_path = os.path.join(output_dir, 'efficientad_training_loss.png')
-    plt.savefig(loss_path)
-    plt.close()
-
-    print(f"Training loss curve image saved to '{loss_path}'.")
+    # Calculate the mean squared error (MSE) between the teacher and student outputs
+    map_st = torch.mean((teacher_output - student_output[:, :304]) ** 2, dim=1, keepdim=True)
+    # Calculate the MSE between the autoencoder output and the student output
+    map_ae = torch.mean((autoencoder_output - student_output[:, 304:]) ** 2, dim=1, keepdim=True)
+    # Combine prediction maps of student and autoencoder
+    map_combined = 0.5 * map_st + 0.5 * map_ae
+    return map_combined, map_st, map_ae, latency_ms
 
 if __name__ == '__main__':
     main()
