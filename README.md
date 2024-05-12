@@ -20,18 +20,26 @@ Launching instructions:
      cd ..
      ```
 2. After the dataset is extracted, run the preprocess.py script to extract the features for teacher training.
-   - After the script is run, folder './data/features' should be created with 'train' and 'test' features for all categories
+   ```
+   python3 preprocess.py --dataset_dir mvtec_anomaly_detection
+   ```
+      - --dataset_dir: directory of MvTec dataset images (default: mvtec_anomaly_detection)
+   - After the script is run, folder './data/features' should be created with 'train' and 'test' .npy files for all categories
 3. After features are extracted, run the 'train_nf_teacher.py' file to train the teacher model in the following way:
    ```
    python3 train_nf_teacher.py --subdataset bottle --train_steps 240 --dataset_dir mvtec_anomaly_detection
    ```
      - --subdataset: category of MvTec dataset (default: bottle)
      - --train_steps: number of epochs for training (default: 240)
-     - --dataset_dir: directory of MvTec dataset (default: mvtec_anomaly_detection) ???????????????????????????????????????????(adjust the code from mvtec to mvtec_anomaly_detection)
-5. To train the student-autoencoder pair, a folder of at least 200 images from the ImageNet dataset is necessary. Store the folder in the root directory (suggested folder structure: imagenet_pictures/collected_images/{images...})
-   - ????????????????????????????????????? add link to drive of imagenet pictures, zip extraction code
-7. After the training of the teacher is completed, the teacher model for the specified category should be created under folder ./models with the name 'teacher_nf_{subdataset}.pth'
-8. To train the student-autoencoder, run the 'efficientad.py' script in the following way:
+     - --dataset_dir: directory of MvTec dataset (default: mvtec_anomaly_detection)
+4. After the training of the teacher is complete, the teacher model for the specified category should be created under folder ./models with the name 'teacher_nf_{subdataset}.pth'
+5. To train the student-autoencoder pair, a folder of at least 200 images from the ImageNet dataset is necessary.
+   - You can download a .zip file containing a set of 1000 images from ImageNet dataset with the following link:
+   ```
+   https://drive.google.com/uc?export=download&id=1zVPO65iorXScSAZJscvl3q4kJ9HrpF7R
+   ```
+   - Extract the .zip file and store it in the root directory (suggested folder structure: imagenet_pictures/collected_images/{images...})
+6. To train the student-autoencoder, run the 'efficientad.py' script in the following way:
    ```
    python3 efficientad.py --subdataset screw --test_only True --train_steps 100 --dataset_dir mvtec --imagenet_dir imagenet_pictures/collected_images
    ```
@@ -40,7 +48,7 @@ Launching instructions:
      - --train_steps: number of epochs for training (default: 100)
      - --dataset_dir: directory of MvTec dataset (default: mvtec_anomaly_detection) ???????????????????????????????????????????(adjust the code from mvtec to mvtec_anomaly_detection)
      - --imagenet_dir: directory of images from ImageNet (default: imagenet_picures/collected_images)
-9. After training and evaluation of the student-autoencoder pair and teacher are complete, the results should be saved in the corresponding folders:
+7. After training and evaluation of the student-autoencoder pair and teacher are complete, the results should be saved in the corresponding folders:
   - ./models: folder, containing .pth models
   - ./output/results/{subdataset}/teacher_metrics.txt: teacher AUC mean, AUC max, loss difference between first and last epochs, training time
   - ./output/results/{subdataset}/efficientad_metrics.txt: AUC, F1, Recall, Precision scores on image and pixel level, average processing latency
