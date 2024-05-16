@@ -46,7 +46,7 @@ Launching instructions:
      - --subdataset: category of MvTec dataset (default: bottle)
      - --test_only: flag to whether only perform the evaluation (teacher, student, and autoencoder must be under ./models folder in advance for the 'True' flag to work) (default: False)
      - --train_steps: number of epochs for training (default: 100)
-     - --dataset_dir: directory of MvTec dataset (default: mvtec_anomaly_detection) ???????????????????????????????????????????(adjust the code from mvtec to mvtec_anomaly_detection)
+     - --dataset_dir: directory of MvTec dataset (default: mvtec_anomaly_detection)
      - --imagenet_dir: directory of images from ImageNet (default: imagenet_picures/collected_images)
 7. After training and evaluation of the student-autoencoder pair and teacher are complete, the results should be saved in the corresponding folders:
   - ./models: folder, containing .pth models
