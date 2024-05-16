@@ -36,7 +36,7 @@ Launching instructions:
 5. To train the student-autoencoder pair, a folder of at least 200 images from the ImageNet dataset is necessary.
    - You can download a .zip file containing a set of 1000 images from ImageNet dataset with the following link:
    ```
-   https://drive.google.com/uc?export=download&id=1zVPO65iorXScSAZJscvl3q4kJ9HrpF7R
+   https://drive.google.com/uc?export=download&id=11zBF5L5oYNu7qO1ZPCMAoLaNVGu6Sqvr
    ```
    - Extract the .zip file and store it in the root directory (suggested folder structure: imagenet_pictures/collected_images/{images...})
 6. To train the student-autoencoder, run the 'efficientad.py' script in the following way:
