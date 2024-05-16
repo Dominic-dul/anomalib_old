@@ -41,7 +41,7 @@ Launching instructions:
    - Extract the .zip file and store it in the root directory (suggested folder structure: imagenet_pictures/collected_images/{images...})
 6. To train the student-autoencoder, run the 'efficientad.py' script in the following way:
    ```
-   python3 efficientad.py --subdataset screw --test_only False --train_steps 100 --dataset_dir mvtec --imagenet_dir imagenet_pictures/collected_images
+   python3 efficientad.py --subdataset screw --test_only False --train_steps 100 --dataset_dir mvtec_anomaly_detection --imagenet_dir imagenet_pictures/collected_images
    ```
      - --subdataset: category of MvTec dataset (default: bottle)
      - --test_only: flag to whether only perform the evaluation (teacher, student, and autoencoder must be under ./models folder in advance for the 'True' flag to work) (default: False)
