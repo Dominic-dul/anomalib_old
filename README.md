@@ -11,7 +11,7 @@ Launching instructions:
      tar -xvf mvtec_anomaly_detection.tar.xz
      cd ..
      ```
-   - If it is MvTec AD dataset, extract it to a folder name 'mvtec_loco_anomaly_detection'
+   - If it is MvTec LOCO AD dataset, extract it to a folder name 'mvtec_loco_anomaly_detection'
      ```
      mkdir mvtec_loco_anomaly_detection
      cd mvtec_loco_anomaly_detection
